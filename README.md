@@ -1,147 +1,128 @@
 # AetherWebDatabase
 
-Web 文件型文档数据库:整库 JSON 落盘、可选 AES-256-GCM 加密、每库操作串行、
-单条指令原子的集合 CRUD。零依赖、ESM,面向 AetherWebOS 应用(短信 / 邮件 / 日记等)的轻量持久层。
+OPFS 分页文档数据库:4KB 固定页、双超级块原子提交、可选页级 AES-256-GCM、
+每库操作串行、单条指令原子的集合 CRUD。零依赖 ESM,面向 AetherWebOS 应用。
 
 ## 能力边界(刻意维持)
 
 **有**
 
-- 一个「数据库文件」= 一条存储记录(`awdb.<name>`),内容为整库 JSON
+- 一个「数据库文件」= OPFS 上的 `awdb/<name>.awdb`,固定 **4096B 页**
+- page0/1 **双超级块**(CRC + generation),CoW 写脏页后翻转另一槽 → 单指令原子
 - 多集合文档库:`insert / get / find / update / remove` 系列
-- 整库可选加密(AES-256-GCM,PBKDF2-SHA-256 × 150000 派生)
-- 同名库句柄单例 + 每库 Promise 队列串行(同文件单线程;异库互不阻塞)
-- 单条指令原子:变更前备份 → 同步改内存 → 序列化/加密/落盘;失败回滚
-- 存储适配可注入(默认 `localStorage`,测试用 `memoryStorage`)
+- **页级** AES-256-GCM(每页独立 IV;PBKDF2 密钥 open 时派生一次并缓存)
+- 文档可跨页(加密逻辑 chunk = 4068B;明文 = 4096B)
+- 同名库句柄单例 + 每库 Promise 队列(同文件单线程;异库互不阻塞)
+- 存储适配:默认 OPFS,测试注入 `createMemoryBackend()`
 
 **没有(刻意)**
 
-- 视图、索引、联表
+- B+树 / 二级索引 / 视图 / SQL
 - 跨语句事务(仅单条指令原子)
-- 多标签页 / 多进程协同(单 JS 上下文内保证)
-- SQL
-
-## 安装 / 引用
-
-仓库即包:`aether-webdatabase`(ESM)。webos 以 `vendor/AetherWebDatabase` 子模块引用:
-
-```js
-import { open } from '../../vendor/AetherWebDatabase/src/index.js';
-// 或包名(若已 link): import { open } from 'aether-webdatabase';
-```
+- 多标签页协同
 
 ## 快速上手
 
 ```js
 import { open } from 'aether-webdatabase';
 
-// 明文库
+// 浏览器默认 OPFS
 const db = await open('sms');
-
-// 加密库(整库 AWDB1:* 落盘)
+// 加密(页级)
 const secret = await open('journal', { password: 'user-pass' });
+// Node / 测试
+const test = await open('t', { storage: 'memory' });
 
 const msgs = db.collection('messages');
-
-// 增
 const m = await msgs.insert({ from: '10086', text: '验证码 1234', date: Date.now() });
-// m.id 已自动生成;也可传 { id: '显式', ... }
-
-// 查
 const list = await msgs.find({ from: '10086' }, { sort: { date: -1 }, limit: 20 });
-const one = await msgs.findOne((d) => d.text.includes('1234'));
-const n = await msgs.count({ from: '10086' });
-
-// 改
 await msgs.update(m.id, { read: true });
-await msgs.updateWhere({ read: false }, { read: true });
-
-// 删
 await msgs.remove(m.id);
-await msgs.removeWhere({ from: '10086' });
 ```
 
-## API
+## 文件格式
 
-### `open(name, opts?) → Promise<Database>`
+```
+页 0  超级块槽 A(明文)
+页 1  超级块槽 B(明文)
+页 2+ 数据页
+```
 
-| 参数 | 说明 |
+超级块字段(64B + 零填充到 4096):
+
+| 偏移 | 宽度 | 字段 |
+|---|---|---|
+| 0 | 8 | magic `AWDBPG01` |
+| 8 | 4 | version |
+| 12 | 4 | pageSize (=4096) |
+| 16 | 4 | chunkSize |
+| 20 | 4 | generation |
+| 24 | 1 | encrypted |
+| 28 | 16 | salt(PBKDF2) |
+| 44 | 4 | catalogStart |
+| 48 | 4 | catalogPages |
+| 52 | 4 | catalogByteLen |
+| 56 | 4 | pageCount |
+| 60 | 4 | CRC32(bytes[0..59]) |
+
+**数据页(加密):** `[IV 12B][AES-GCM(pad(logical, 4068)) → cipher‖tag]` 恰好 4096B。  
+**数据页(明文):** 逻辑载荷零填充到 4096B。
+
+**目录 JSON:**
+
+```json
+{
+  "free": [12, 15],
+  "cols": {
+    "messages": {
+      "seq": 3,
+      "docs": { "c1-…": { "p": [4, 5], "n": 5000 } }
+    }
+  }
+}
+```
+
+`p` = 页号列表,`n` = 文档 UTF-8 字节长。
+
+## 原子提交(CoW)
+
+```
+insert/update/remove
+  → 备份目录 JSON
+  → 分配页(free 或文件尾)并只写「旧超级块未引用」的页
+  → 写新目录页
+  → generation+1 写入另一超级块槽
+  任一步失败 → 不翻槽,旧 generation 仍完整有效;内存回滚
+```
+
+删除/更新只把旧页放回 free(逻辑),**不**整库重加密;
+新数据只写入 free/扩展区页。
+
+## 加密
+
+| 点 | 做法 |
 |---|---|
-| `name` | 库名,对应存储键 `awdb.<name>` |
-| `opts.password` | 加密密码;已有明文库传密码会**自动升级**为加密 |
-| `opts.storage` | 存储适配,默认 `localStorage` |
+| 粒度 | **每数据页独立** AES-256-GCM |
+| IV | 每次写页随机 12B,存页首 |
+| 密钥 | PBKDF2-SHA-256 × 150000,salt 在超级块;**open 派生一次缓存** |
+| 超级块 | 始终明文(要读 salt/目录定位) |
 
-同 `storage` + 同 `name` 并发 `open` 返回**同一句柄**。已用密码 A 打开时再传 B 会抛错。
-加密库无密码 / 密码错误时 `open` 抛错。
+删一行 ≠ 整库重加密:只改目录 + 该文档的页(新页从 free/尾部分配)。
 
-### `Database`
+## API 摘要
 
 | 方法 | 说明 |
 |---|---|
-| `collection(name)` | 集合句柄(首次写入才建壳) |
-| `listCollections()` | 已有集合名列表 |
-| `dropCollection(name)` | 删集合 |
-| `setPassword(p \| null)` | 换密 / 转明文 |
-| `exportJSON()` / `importJSON(json)` | 整库导出(明文)/ 导入(覆盖) |
-| `drop()` | 删库文件并关闭句柄 |
-| `close()` | 关闭句柄(不删文件) |
-| `encrypted` / `closed` / `name` | 状态 |
+| `open(name, { password?, storage? })` | 打开;`storage`: `'opfs'`(默认)/ `'memory'` / 自定义后端 |
+| `db.collection(name)` | 集合句柄 |
+| `col.insert / insertMany / get / find / findOne / count` | 增查 |
+| `col.update / updateWhere / remove / removeWhere / clear` | 改删 |
+| `db.exportJSON() / importJSON(json)` | 含文档体的整库导出/导入 |
+| `db.setPassword(p \| null)` | 换密 / 转明文(紧凑重写) |
+| `db.drop() / close()` | 删库 / 关句柄 |
+| `createMemoryBackend()` | 测试后端(`failWrites` 可模拟写失败) |
 
-### `Collection`
-
-| 方法 | 说明 |
-|---|---|
-| `insert(doc)` | 插入;`doc.id` 已存在抛错;返回带 id 副本 |
-| `insertMany(docs)` | 批量;全部成功或全部回滚 |
-| `get(id)` | 按 id;无 → `null` |
-| `find(filter?, opts?)` | `filter` 函数或平面对象;`opts: { sort, limit, offset }` |
-| `findOne(filter?)` | 第一条 |
-| `count(filter?)` | 计数 |
-| `update(id, patch)` | 浅合并;不可改 id;无 → `null` |
-| `updateWhere(filter, patch)` | 批量浅合并;返回条数 |
-| `remove(id)` / `removeWhere(filter)` | 删除 |
-| `clear()` | 清空集合 |
-
-读写返回值均为**深拷贝**,外部改动不会污染库内状态。
-
-### 存储适配
-
-```js
-import { memoryStorage, localAdapter, storageKey } from 'aether-webdatabase';
-
-const mem = memoryStorage();           // 测试用;mem.failWrites = true 可模拟写失败
-const db = await open('t', { storage: mem });
-// 自定义: { getItem(k), setItem(k, v), removeItem(k) } 同步三件套即可
-```
-
-### 加密格式
-
-```
-AWDB1:<base64(salt16)>:<base64(iv12)>:<base64(ciphertext)>
-```
-
-- 密钥:PBKDF2-SHA-256,150000 次迭代,AES-GCM-256
-- 每次写盘随机 salt/IV
-- 与 AetherWebOS `WEOS1` 文件加密同构,前缀区分
-
-明文库直接存 JSON(以 `{` 开头),两种格式靠前缀区分。
-
-## 原子性与并发
-
-```
-open('sms') ──► 单例句柄 + 每库串行队列
-                    │
-                    ▼
-              insert/update/... ──► 备份 JSON ──► 改内存 ──► 加密+setItem
-                                                    │ fail
-                                                    ▼
-                                               内存回滚备份
-```
-
-- **同库**全部操作(含读)进同一队列,不会交错改盘
-- **异库**并行,互不等待
-- 仅单条指令原子;`insertMany` 算一条指令(全成或全败)
-- 无跨语句事务
+读写返回值均为深拷贝。
 
 ## 测试
 
@@ -149,6 +130,8 @@ open('sms') ──► 单例句柄 + 每库串行队列
 node test/db-test.mjs
 # 或 npm test
 ```
+
+Node 无 OPFS,测试全走 memory 后端;页格式与提交协议与 OPFS 相同。
 
 ## License
 

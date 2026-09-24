@@ -1,14 +1,15 @@
 {
   "name": "aether-webdatabase",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Web 文件型文档数据库:整库 JSON 落盘、可选 AES-GCM 加密、每库单线程串行、单条指令原子的集合 CRUD,零依赖",
+  "description": "OPFS 分页文档数据库:4KB 页、双超级块原子提交、可选页级 AES-GCM、每库串行、单条指令原子的集合 CRUD,零依赖",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./crypto": "./src/crypto.js",
     "./storage": "./src/storage.js",
-    "./database": "./src/database.js"
+    "./database": "./src/database.js",
+    "./page": "./src/page.js"
   },
   "scripts": {
     "test": "node test/db-test.mjs"
@@ -21,11 +22,12 @@
   "keywords": [
     "database",
     "document-store",
-    "localStorage",
+    "opfs",
+    "paged",
     "encryption",
     "aes-gcm",
     "webos",
-    "嵌入式",
+    "分页",
     "文档库"
   ],
   "sideEffects": false,
