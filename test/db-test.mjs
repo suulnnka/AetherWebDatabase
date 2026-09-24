@@ -1,16 +1,21 @@
-/* AetherWebDatabase(OPFS 分页版)测试:CRUD / 原子回滚 / 页级加密 / 单例串行 / 导入导出 / 大文档跨页。
+/* AetherWebDatabase 测试:CRUD / 原子回滚 / 页级加密 / 单例串行 / 导入导出 / 大文档跨页。
  *
  * 运行:node test/db-test.mjs
- * Node 无 OPFS → 全部走 memory 后端;页格式与提交协议与 OPFS 相同。
+ *
+ * 库不直连 OPFS。主路径:Node 模拟 webos VFS(mock-webos-fs)+ createFileBackend
+ * (与生产 appdata 相同的字符串文件后端);另保留 memory 后端做对照。
  */
 import assert from 'node:assert';
 import {
   open,
   closeAll,
   createMemoryBackend,
+  createFileBackend,
+  FILE_MAGIC,
   PAGE_SIZE,
   decodeSuper,
 } from '../src/index.js';
+import { createMockWebosFs } from './mock-webos-fs.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -29,6 +34,18 @@ const eq = (got, want, msg) =>
 const deepEq = (got, want, msg) =>
   t(msg, JSON.stringify(got) === JSON.stringify(want), `得到 ${JSON.stringify(got)},期望 ${JSON.stringify(want)}`);
 
+/**
+ * 模拟 webos 文件库:独立 mock FS + .awdb 路径 + createFileBackend。
+ * @returns {{ fs: object, path: string, storage: object }}
+ */
+function fileDb(name = 'test') {
+  const fs = createMockWebosFs();
+  fs.mkdir('/home/u/appdata');
+  const path = `/home/u/appdata/${name}.awdb`;
+  const storage = createFileBackend(fs, path);
+  return { fs, path, storage };
+}
+
 const mem = () => createMemoryBackend();
 
 /** 读槽 0/1 超级块(断言用) */
@@ -40,12 +57,13 @@ async function supers(storage) {
 
 /* ---------- open / 单例 ---------- */
 section('open / 单例', async () => {
-  const storage = mem();
+  const { storage, path, fs } = fileDb('db1');
   const a = await open('db1', { storage });
   const b = await open('db1', { storage });
   t('同名 open 返回同一句柄', a === b);
 
-  const c = await open('db2', { storage });
+  const other = fileDb('db2');
+  const c = await open('db2', { storage: other.storage });
   t('不同名是不同句柄', a !== c);
 
   const [p1, p2, p3] = await Promise.all([
@@ -65,11 +83,16 @@ section('open / 单例', async () => {
   const { a: sa, b: sb } = await supers(storage);
   t('至少一个合法超级块', !!(sa || sb));
   t('超级块分页尺寸 4096', (sa || sb).pageSize === PAGE_SIZE);
+
+  // 落在模拟 VFS 的 .awdb 路径,内容为 FILE_MAGIC 前缀
+  t('文件路径带 .awdb', path.endsWith('.awdb'));
+  const raw = fs.read(path);
+  t('落盘为 AWDBVFS1 文件', typeof raw === 'string' && raw.startsWith(FILE_MAGIC));
 });
 
 /* ---------- CRUD ---------- */
 section('CRUD', async () => {
-  const storage = mem();
+  const { storage } = fileDb('crud');
   const db = await open('crud', { storage });
   const msgs = db.collection('messages');
 
@@ -145,15 +168,15 @@ section('CRUD', async () => {
 
 /* ---------- 原子性 ---------- */
 section('单条指令原子性', async () => {
-  const storage = mem();
+  const { storage, fs } = fileDb('atomic');
   const db = await open('atomic', { storage });
   const c = db.collection('t');
   await c.insert({ id: '1', n: 1 });
   await c.insert({ id: '2', n: 2 });
 
-  storage.failWrites = true;
+  fs.failWrites = true;
   await assert.rejects(() => c.insert({ id: '3', n: 3 }), /write failed/);
-  storage.failWrites = false;
+  fs.failWrites = false;
 
   eq(await c.count(), 2, '失败插入未进入内存');
   eq(await c.get('3'), null, '失败 id 不可见');
@@ -161,17 +184,16 @@ section('单条指令原子性', async () => {
   eq(ok.id, '4', '失败后队列恢复');
 
   const before = await c.get('1');
-  storage.failWrites = true;
+  fs.failWrites = true;
   await assert.rejects(() => c.update('1', { n: 999 }), /write failed/);
-  storage.failWrites = false;
+  fs.failWrites = false;
   eq((await c.get('1')).n, before.n, 'update 失败内存回滚');
 
-  storage.failWrites = true;
+  fs.failWrites = true;
   await assert.rejects(() => c.remove('2'), /write failed/);
-  storage.failWrites = false;
+  fs.failWrites = false;
   eq((await c.get('2')) != null, true, 'remove 失败内存回滚');
 
-  // 写失败时超级块不应翻转到半状态:generation 与成功提交一致
   const { a, b } = await supers(storage);
   const live = a && b ? (a.generation >= b.generation ? a : b) : a || b;
   t('失败后仍有合法超级块', !!live);
@@ -180,22 +202,32 @@ section('单条指令原子性', async () => {
 
 /* ---------- 页级加密 ---------- */
 section('页级加密', async () => {
-  const storage = mem();
+  const { storage, fs } = fileDb('secret');
   const db = await open('secret', { storage, password: 'pw123' });
   t('句柄报告 encrypted', db.encrypted);
 
   const col = db.collection('kv');
   await col.insert({ id: 'k', v: '敏感数据' });
 
-  // 数据页(页号≥2)不应出现明文
-  const pageCount = await storage.pageCount();
+  // VFS 文件整体是 base64;解码后数据页不应出现明文
+  const raw = fs.read(`/home/u/appdata/secret.awdb`);
+  t('文件为 AWDBVFS1', raw.startsWith(FILE_MAGIC));
   let plainLeak = false;
+  try {
+    const bytes = Uint8Array.from(atob(raw.slice(FILE_MAGIC.length)), (ch) => ch.charCodeAt(0));
+    const asText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    if (asText.includes('敏感数据')) plainLeak = true;
+  } catch { /* 忽略 */ }
+  t('整库 base64 内无明文', !plainLeak);
+
+  const pageCount = await storage.pageCount();
+  let pageLeak = false;
   for (let i = 2; i < Math.min(pageCount, 8); i++) {
     const page = await storage.readPage(i);
     const asText = new TextDecoder('utf-8', { fatal: false }).decode(page);
-    if (asText.includes('敏感数据')) plainLeak = true;
+    if (asText.includes('敏感数据')) pageLeak = true;
   }
-  t('数据页无明文泄漏', !plainLeak);
+  t('数据页无明文泄漏', !pageLeak);
 
   const { a, b } = await supers(storage);
   const live = a && b ? (a.generation >= b.generation ? a : b) : a || b;
@@ -213,31 +245,29 @@ section('页级加密', async () => {
   );
   await assert.rejects(() => open('secret', { storage }), /需要密码/, '缺密码');
 
-  // 明文库 + 密码 → 升级
-  const plainStore = mem();
-  const p1 = await open('up', { storage: plainStore });
+  const plain = fileDb('up');
+  const p1 = await open('up', { storage: plain.storage });
   await p1.collection('a').insert({ n: 1 });
   p1.close();
-  const p2 = await open('up', { storage: plainStore, password: 'newpw' });
+  const p2 = await open('up', { storage: plain.storage, password: 'newpw' });
   t('升级后 encrypted', p2.encrypted);
-  const { a: sa } = await supers(plainStore);
-  const live2 = sa;
-  t('超级块已标记加密', live2?.encrypted === 1);
+  const { a: sa } = await supers(plain.storage);
+  t('超级块已标记加密', sa?.encrypted === 1);
   eq(await p2.collection('a').count(), 1, '升级后数据仍在');
 
   await p2.setPassword('pw2');
   p2.close();
-  const p3 = await open('up', { storage: plainStore, password: 'pw2' });
+  const p3 = await open('up', { storage: plain.storage, password: 'pw2' });
   eq(await p3.collection('a').count(), 1, '换密后可读');
 
   await assert.rejects(
-    () => open('up', { storage: plainStore, password: 'other' }),
+    () => open('up', { storage: plain.storage, password: 'other' }),
     /其他密码/,
     '换密码 open 拒绝',
   );
 
   await p3.setPassword(null);
-  const { a: sa3, b: sb3 } = await supers(plainStore);
+  const { a: sa3, b: sb3 } = await supers(plain.storage);
   const live3 = sa3 && sb3
     ? (sa3.generation >= sb3.generation ? sa3 : sb3)
     : (sa3 || sb3);
@@ -246,7 +276,7 @@ section('页级加密', async () => {
 
 /* ---------- 串行与交错 ---------- */
 section('同库串行 / 异库独立', async () => {
-  const storage = mem();
+  const { storage } = fileDb('ser');
   const db = await open('ser', { storage, password: 'p' });
   const c = db.collection('n');
 
@@ -257,25 +287,27 @@ section('同库串行 / 异库独立', async () => {
   eq(await c.count(), 20, '并发后计数 20');
   eq(new Set(results.map((r) => r.id)).size, 20, 'id 无碰撞');
 
-  const s2 = mem();
-  const d1 = await open('A', { storage: s2 });
-  const d2 = await open('B', { storage: s2 });
-  // 同一 storage 对象不同 name → 不同注册键? open 用 backend 对象作键且 name 分槽
-  // 这里 A/B 不同文件,但同一 storage 对象会共享 registry Map 按 name 分 — OK
+  // 同一 mock FS 上两个不同 .awdb 文件
+  const fsShared = createMockWebosFs();
+  fsShared.mkdir('/home/u/appdata');
+  const beA = createFileBackend(fsShared, '/home/u/appdata/A.awdb');
+  const beB = createFileBackend(fsShared, '/home/u/appdata/B.awdb');
+  const d1 = await open('A', { storage: beA });
+  const d2 = await open('B', { storage: beB });
   await Promise.all([
     d1.collection('c').insert({ x: 1 }),
     d2.collection('c').insert({ x: 2 }),
   ]);
   eq(await d1.collection('c').count(), 1, 'A 独立');
   eq(await d2.collection('c').count(), 1, 'B 独立');
+  t('两个 .awdb 文件都在', fsShared.allFiles().filter((p) => p.endsWith('.awdb')).length >= 2);
 });
 
 /* ---------- 跨页大文档 ---------- */
 section('大文档跨页', async () => {
-  const storage = mem();
+  const { storage } = fileDb('big');
   const db = await open('big', { storage });
   const col = db.collection('blob');
-  // 明文 chunk=4096 → 3 页以上
   const big = 'x'.repeat(PAGE_SIZE * 3 + 123);
   const d = await col.insert({ id: 'big', data: big });
   eq(d.data.length, big.length, '写入长度');
@@ -283,9 +315,8 @@ section('大文档跨页', async () => {
   eq(back.data.length, big.length, '读回长度');
   eq(back.data, big, '跨页内容一致');
 
-  // 加密库跨页( chunk=4068)
-  const encStore = mem();
-  const edb = await open('bigenc', { storage: encStore, password: 'pw' });
+  const enc = fileDb('bigenc');
+  const edb = await open('bigenc', { storage: enc.storage, password: 'pw' });
   const ecol = edb.collection('blob');
   const ebig = 'y'.repeat(4068 * 2 + 50);
   await ecol.insert({ id: 'e', data: ebig });
@@ -294,7 +325,7 @@ section('大文档跨页', async () => {
 
 /* ---------- 导入导出 ---------- */
 section('export / import', async () => {
-  const storage = mem();
+  const { storage } = fileDb('io');
   const db = await open('io', { storage });
   await db.collection('c').insert({ id: '1', v: 'keep' });
   const json = await db.exportJSON();
@@ -312,7 +343,7 @@ section('export / import', async () => {
 
 /* ---------- drop ---------- */
 section('drop', async () => {
-  const storage = mem();
+  const { storage } = fileDb('gone');
   const db = await open('gone', { storage, password: 'z' });
   await db.collection('c').insert({ n: 1 });
   await db.drop();
@@ -325,7 +356,7 @@ section('drop', async () => {
 
 /* ---------- SMS 场景 ---------- */
 section('短信场景冒烟', async () => {
-  const storage = mem();
+  const { storage } = fileDb('sms');
   const db = await open('sms', { storage, password: 'user-secret' });
   const chats = db.collection('chats');
   const msgs = db.collection('messages');
@@ -344,6 +375,19 @@ section('短信场景冒烟', async () => {
   eq((await db2.collection('messages').get(m.id))?.text, '验证码 123456', '重启后消息仍在');
 });
 
+/* ---------- memory 对照 ---------- */
+section('memory 后端对照', async () => {
+  const storage = mem();
+  const db = await open('memonly', { storage });
+  await db.collection('t').insert({ n: 1 });
+  eq(await db.collection('t').count(), 1, 'memory CRUD');
+
+  storage.failWrites = true;
+  await assert.rejects(() => db.collection('t').insert({ n: 2 }), /write failed/, 'memory 写失败');
+  storage.failWrites = false;
+  eq(await db.collection('t').count(), 1, 'memory 失败回滚');
+});
+
 /* ---------- 跑 ---------- */
 closeAll();
 for (const s of sections) {
@@ -356,5 +400,5 @@ for (const s of sections) {
   }
 }
 
-console.log(`\n====== AetherWebDatabase(paged): ${pass} pass, ${fail} fail ======`);
+console.log(`\n====== AetherWebDatabase(paged+vfs): ${pass} pass, ${fail} fail ======`);
 process.exit(fail ? 1 : 0);

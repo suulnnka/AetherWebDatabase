@@ -1,19 +1,21 @@
 /* ============================================================
- * AetherWebDatabase —— OPFS 分页文档数据库(独立仓库,webos 子模块引用)
+ * AetherWebDatabase —— 分页文档数据库(独立仓库,webos 子模块引用)
  *
  * 面向 webos 应用(短信 / 邮件 / 日记等)的轻量持久层:
- *   · OPFS 文件 + 4KB 固定页;双超级块原子提交;
+ *   · 4KB 固定页;双超级块原子提交;
  *   · 可选页级 AES-256-GCM(密钥缓存,页独立 IV);
  *   · 同名库句柄单例 + 每库操作串行;
- *   · 集合级 CRUD,单条指令原子;无视图、无跨语句事务。
+ *   · 集合级 CRUD,单条指令原子;无视图、无跨语句事务;
+ *   · **不直连 OPFS**——存储经注入后端(VFS 字符串文件 / 内存 / 自定义)。
  * ============================================================ */
 
 export { open, Database, Collection, closeAll } from './database.js';
 export {
   createMemoryBackend,
-  createOpfsBackend,
+  createFileBackend,
   openBackend,
   memoryStorage,
+  FILE_MAGIC,
 } from './storage.js';
 export {
   PAGE_SIZE,
@@ -37,9 +39,10 @@ export {
 import { open, Database, Collection, closeAll } from './database.js';
 import {
   createMemoryBackend,
-  createOpfsBackend,
+  createFileBackend,
   openBackend,
   memoryStorage,
+  FILE_MAGIC,
 } from './storage.js';
 import { PAGE_SIZE, encodeSuper, decodeSuper, pickSuper, crc32 } from './page.js';
 import { cryptoDb, encryptText, decryptText, isEncrypted } from './crypto.js';
@@ -50,9 +53,10 @@ const AetherWebDatabase = {
   Collection,
   closeAll,
   createMemoryBackend,
-  createOpfsBackend,
+  createFileBackend,
   openBackend,
   memoryStorage,
+  FILE_MAGIC,
   PAGE_SIZE,
   encodeSuper,
   decodeSuper,

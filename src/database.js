@@ -1,8 +1,8 @@
 /* ============================================================
- * Database / Collection —— OPFS 分页文档库
+ * Database / Collection —— 分页文档库(不直连 OPFS)
  *
  * 模型:
- *   · 一个库 = 一个 `.awdb` 文件,固定 4096B 页(OPFS 或注入后端);
+ *   · 一个库 = 一个 `.awdb` 文件,固定 4096B 页(注入后端承载);
  *   · page0/1 双超级块(CRC + generation),写脏页后翻转另一槽 → 单指令原子;
  *   · 目录 JSON(free + cols)存连续数据页;文档 UTF-8 字节按 chunk 分片;
  *   · 可选页级 AES-GCM(密钥 open 时 PBKDF2 一次并缓存);
@@ -909,11 +909,12 @@ function mapFor(bucket, key) {
  * @param {string} name
  * @param {object} [opts]
  * @param {string} [opts.password]
- * @param {object|string} [opts.storage] 'opfs'(默认)| 'memory'| 自定义后端对象
+ * @param {object|string} [opts.storage] 自定义后端 | 'memory'(默认)| 工厂函数;
+ *   **禁止隐式 OPFS** —— 浏览器/宿主须注入 createFileBackend 或自定义后端
  */
 export async function open(name, opts = {}) {
   if (!name || typeof name !== 'string') throw new Error('库名必须是非空字符串');
-  const storage = opts.storage ?? 'opfs';
+  const storage = opts.storage ?? 'memory';
   const backend = await openBackend(name, storage);
   // 自定义对象 / memory 函数每次可能新实例:用 storage 引用或字符串作注册键
   const regKey = typeof storage === 'object' && storage !== null ? storage : `${String(storage)}:${name}`;

@@ -1,8 +1,8 @@
 {
   "name": "aether-webdatabase",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "OPFS 分页文档数据库:4KB 页、双超级块原子提交、可选页级 AES-GCM、每库串行、单条指令原子的集合 CRUD,零依赖",
+  "description": "分页文档数据库:4KB 页、双超级块原子提交、可选页级 AES-GCM;不直连 OPFS,存储经注入后端(.awdb 字符串文件/内存)",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
@@ -22,11 +22,12 @@
   "keywords": [
     "database",
     "document-store",
-    "opfs",
     "paged",
+    "awdb",
     "encryption",
     "aes-gcm",
     "webos",
+    "vfs",
     "分页",
     "文档库"
   ],
