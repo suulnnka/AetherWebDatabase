@@ -123,8 +123,9 @@ node test/db-test.mjs
 # 或 npm test
 ```
 
-测试不依赖 OPFS:`test/mock-webos-fs.mjs` 提供与 webos VFS 同形的
-`read/write/mkdir` 模拟文件系统,主用例经 `createFileBackend` 走 `.awdb` 文件路径。
+测试不依赖 OPFS:`test/mock-webos-fs.mjs` 对齐 webos `fs.js` 的 **inode 式拆分**
+（元数据树无 `d`、内容独立存储，概念上对应 OPFS `fs.v2.json` + `fsdata/`），
+API 为同步 `read/write/mkdir/exists/isDir`；主用例经 `createFileBackend` 走 `.awdb` 路径。
 
 ## License
 

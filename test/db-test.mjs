@@ -88,6 +88,13 @@ section('open / 单例', async () => {
   t('文件路径带 .awdb', path.endsWith('.awdb'));
   const raw = fs.read(path);
   t('落盘为 AWDBVFS1 文件', typeof raw === 'string' && raw.startsWith(FILE_MAGIC));
+
+  // 对齐 webos inode 拆分:元数据无 d,内容独立存放
+  const metaNode = fs.dumpMeta()[path];
+  t('元数据节点存在', !!metaNode);
+  t('元数据无内联内容 d', metaNode && metaNode.d === undefined);
+  t('内容在独立存储', Object.keys(fs.dumpContents()).includes(path));
+  t('isDir/exists 对齐', fs.isDir('/home/u/appdata') && fs.exists(path) && !fs.isDir(path));
 });
 
 /* ---------- CRUD ---------- */
