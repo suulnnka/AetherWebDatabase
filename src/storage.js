@@ -3,7 +3,7 @@
  *
  * 库本身**不直连 OPFS**。调用方必须注入后端:
  *   · createMemoryBackend()     内存(单元测试)
- *   · createFileBackend(fs, p)  字符串文件(VFS / 模拟 FS)
+ *   · createFileBackend(fs, p)  字节文件(VFS / 模拟 FS / 宿主注入)
  *   · 自定义 { readPage, writePages, pageCount }
  *
  * open() 未传 storage 时默认 memory(避免误走浏览器私有存储)。
@@ -14,17 +14,11 @@ import { PAGE_SIZE } from './page.js';
 /** 字符串 kind 缓存: 仅 memory:name */
 const backendCache = new Map();
 
-/** 整库落进字符串文件的魔数前缀(与 webos appdata 一致) */
+/**
+ * 旧格式标记(仅**读取兼容**;新写入不再 base64 包装)。
+ * 形如 `AWDBVFS1:<base64(整库字节)>`。
+ */
 export const FILE_MAGIC = 'AWDBVFS1:';
-
-const u8ToB64 = (u8) => {
-  let s = '';
-  for (let i = 0; i < u8.length; i += 0x8000) {
-    s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
-  }
-  return btoa(s);
-};
-const b64ToU8 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
 /* ---------- 内存后端 ---------- */
 
@@ -64,49 +58,74 @@ export function createMemoryBackend() {
   };
 }
 
-/* ---------- 字符串文件后端(VFS / 模拟 FS) ---------- */
+/* ---------- 字节文件后端(VFS / 模拟 FS / OPFS 经宿主注入) ---------- */
 
 /**
- * @typedef {object} StringFileFs
- * @property {(path: string, opts?: object) => string|null} read
- * @property {(path: string, content: string, opts?: object) => boolean} write
+ * @typedef {object} ByteFileFs
+ * @property {(path: string, opts?: object) => string|null} [read]
+ * @property {(path: string, content: string, opts?: object) => boolean} [write]
+ * @property {(path: string, opts?: object) => Uint8Array|null} [readBinary]
+ * @property {(path: string, data: Uint8Array, opts?: object) => boolean} [writeBinary]
  */
 
+const u8ToB64 = (u8) => {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const b64ToU8 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
 /**
- * 把分页库存成字符串文件:`FILE_MAGIC + base64(整库字节)`。
- * 读时整文件进内存,按页号切片;写时整文件回写——与 webos VFS 一致,
- * 不依赖 OPFS 字节偏移。
+ * 把分页库存成**二进制文件**(不再 base64 包一层)。
+ * 优先 `readBinary`/`writeBinary`;否则退回字符串 read/write,
+ * 并兼容旧格式 `FILE_MAGIC + base64`。
  *
- * @param {StringFileFs} fsLike  至少 read/write
- * @param {string} path          文件路径(建议带 .awdb 扩展名)
- * @param {object} [opts]        透传给 fs.read/write 的选项(如 { as: user })
+ * @param {ByteFileFs} fsLike
+ * @param {string} path  建议带 .awdb 扩展名
+ * @param {object} [opts] 透传给 fs 的选项(如 { as: user })
  */
 export function createFileBackend(fsLike, path, opts = {}) {
-  if (!fsLike || typeof fsLike.read !== 'function' || typeof fsLike.write !== 'function') {
-    throw new Error('createFileBackend 需要 { read, write } 文件系统适配');
+  if (!fsLike || (typeof fsLike.writeBinary !== 'function' && typeof fsLike.write !== 'function')) {
+    throw new Error('createFileBackend 需要 writeBinary 或 write');
   }
   if (!path || typeof path !== 'string') throw new Error('createFileBackend 需要文件路径');
 
   let buf = null;
 
+  function loadBytes() {
+    if (typeof fsLike.readBinary === 'function') {
+      const b = fsLike.readBinary(path, opts);
+      if (b instanceof Uint8Array) return b;
+    }
+    if (typeof fsLike.read === 'function') {
+      const raw = fsLike.read(path, opts);
+      // 旧格式:AWDBVFS1:<base64>
+      if (raw && typeof raw === 'string' && raw.startsWith(FILE_MAGIC)) {
+        try {
+          return b64ToU8(raw.slice(FILE_MAGIC.length));
+        } catch {
+          return new Uint8Array(0);
+        }
+      }
+    }
+    return new Uint8Array(0);
+  }
+
   async function ensureLoaded() {
     if (buf) return;
-    const raw = fsLike.read(path, opts);
-    if (raw && raw.startsWith(FILE_MAGIC)) {
-      try {
-        buf = b64ToU8(raw.slice(FILE_MAGIC.length));
-      } catch {
-        buf = new Uint8Array(0);
-      }
-    } else {
-      buf = new Uint8Array(0);
-    }
+    buf = loadBytes();
   }
 
   /** 把候选缓冲写入文件;成功后由调用方提交 buf */
   async function flushTo(bytes) {
     if (!bytes) return;
-    const ok = fsLike.write(path, FILE_MAGIC + u8ToB64(bytes), opts);
+    let ok = false;
+    if (typeof fsLike.writeBinary === 'function') {
+      ok = fsLike.writeBinary(path, bytes, opts);
+    } else if (typeof fsLike.write === 'function') {
+      // 仅字符串 FS:仍用旧包装(宿主应优先实现 writeBinary)
+      ok = fsLike.write(path, FILE_MAGIC + u8ToB64(bytes), opts);
+    }
     if (!ok) {
       const err = new Error(`写入失败: ${path}`);
       err.name = 'QuotaExceededError';

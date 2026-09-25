@@ -42,7 +42,7 @@ const m2 = await open('t2');
 
 ## 文件格式
 
-库文件名建议带 **`.awdb`** 扩展名(如 `sms.awdb`)。
+库文件名建议带 **`.awdb`** 扩展名(如 `sms.awdb`)。内容为**原始字节**(4KB 页拼接),**不再 base64 包装**;旧 `AWDBVFS1:<base64>` 文件读取时自动解码。
 
 ```
 页 0  超级块槽 A(明文)
@@ -50,11 +50,7 @@ const m2 = await open('t2');
 页 2+ 数据页
 ```
 
-经字符串文件落盘时整体为:
-
-```
-AWDBVFS1:<base64(页文件字节)>
-```
+经宿主文件系统落盘时即为该字节序列(如 OPFS `fsdata/…/sms.awdb`)。
 
 超级块字段(64B + 零填充到 4096):
 
@@ -89,7 +85,7 @@ insert/update/remove
   任一步失败 → 不翻槽,旧 generation 仍完整有效;内存回滚
 ```
 
-字符串文件后端在内存里按页号随机改,回写时整文件 `fs.write`(VFS 无字节偏移)。
+字符串/字节文件后端在内存里按页号随机改,flush 时整文件回写(宿主无字节偏移时);优先 `writeBinary` 落**原始字节**。
 
 ## 加密
 
@@ -105,7 +101,7 @@ insert/update/remove
 | 方法 | 说明 |
 |---|---|
 | `open(name, { password?, storage? })` | 打开;`storage` 必须是注入后端或 `'memory'`(默认) |
-| `createFileBackend(fs, path, opts?)` | 字符串文件后端(带 `.awdb` 路径) |
+| `createFileBackend(fs, path, opts?)` | 字节文件后端(优先 `writeBinary`,带 `.awdb` 路径) |
 | `createMemoryBackend()` | 内存后端(`failWrites` 模拟写失败) |
 | `db.collection(name)` | 集合句柄 |
 | `col.insert / insertMany / get / find / findOne / count` | 增查 |

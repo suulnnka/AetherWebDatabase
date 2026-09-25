@@ -125,17 +125,37 @@ export function createMockWebosFs() {
       return true;
     },
 
-    /** 读文件;不存在或为目录 → null(对齐 fs.read) */
+    /** 读文件;不存在或为目录 → null(对齐 fs.read;二进制返回 Uint8Array) */
     read(p /*, opts */) {
       const n = norm(p);
       const m = meta.get(n);
       if (!m || m.t !== 'f') return null;
-      return contents.has(n) ? contents.get(n) : null;
+      if (!contents.has(n)) return null;
+      return contents.get(n);
+    },
+
+    /**
+     * 读二进制;返回 Uint8Array 副本。兼容旧 base64 字符串。
+     * 对齐 webos fs.readBinary。
+     */
+    readBinary(p, opts) {
+      const raw = this.read(p, opts);
+      if (raw == null) return null;
+      if (raw instanceof Uint8Array) return raw.slice();
+      if (typeof raw === 'string') {
+        if (raw.startsWith('AWDBVFS1:')) {
+          try {
+            return Uint8Array.from(atob(raw.slice(9)), (c) => c.charCodeAt(0));
+          } catch { /* 落到 UTF-8 */ }
+        }
+        return new TextEncoder().encode(raw);
+      }
+      return new Uint8Array(0);
     },
 
     /**
      * 写文件(自动建父目录)。
-     * 内容只进 contents(= fsdata),元数据节点不携带 d —— 对齐 webos。
+     * content: string | Uint8Array;二进制只进 contents(= fsdata),元数据无 d。
      */
     write(p, content, opts = {}) {
       void opts;
@@ -148,8 +168,6 @@ export function createMockWebosFs() {
       if (!n || n === '/') return false;
       // 目录节点为 null;文件为 {t:'f'}
       if (meta.has(n) && meta.get(n) === null) return false;
-      const existing = meta.get(n);
-      if (existing && existing.t === 'd') return false;
       try {
         ensureParentDirs(n);
       } catch {
@@ -158,8 +176,20 @@ export function createMockWebosFs() {
       if (!meta.has(n) || meta.get(n)?.t !== 'f') {
         meta.set(n, { t: 'f', m: Date.now(), o: 'root', p: 'rw-r--' });
       }
-      contents.set(n, String(content));
+      if (content instanceof Uint8Array) {
+        contents.set(n, content.slice());
+        meta.get(n).bin = true;
+      } else {
+        contents.set(n, String(content));
+        delete meta.get(n).bin;
+      }
       return true;
+    },
+
+    /** 写二进制(对齐 webos fs.write / createFileBackend 首选路径) */
+    writeBinary(p, data, opts) {
+      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+      return this.write(p, bytes, opts);
     },
 
     /** 删文件;目录返回 false(简化) */

@@ -11,7 +11,6 @@ import {
   closeAll,
   createMemoryBackend,
   createFileBackend,
-  FILE_MAGIC,
   PAGE_SIZE,
   decodeSuper,
 } from '../src/index.js';
@@ -84,10 +83,11 @@ section('open / 单例', async () => {
   t('至少一个合法超级块', !!(sa || sb));
   t('超级块分页尺寸 4096', (sa || sb).pageSize === PAGE_SIZE);
 
-  // 落在模拟 VFS 的 .awdb 路径,内容为 FILE_MAGIC 前缀
+  // 落在模拟 VFS 的 .awdb:二进制字节,不再 base64 包装
   t('文件路径带 .awdb', path.endsWith('.awdb'));
-  const raw = fs.read(path);
-  t('落盘为 AWDBVFS1 文件', typeof raw === 'string' && raw.startsWith(FILE_MAGIC));
+  const raw = fs.readBinary(path);
+  t('落盘为二进制页文件', raw instanceof Uint8Array && raw.length > 0);
+  t('非 base64 字符串', typeof fs.read(path) !== 'string');
 
   // 对齐 webos inode 拆分:元数据无 d,内容独立存放
   const metaNode = fs.dumpMeta()[path];
@@ -216,16 +216,15 @@ section('页级加密', async () => {
   const col = db.collection('kv');
   await col.insert({ id: 'k', v: '敏感数据' });
 
-  // VFS 文件整体是 base64;解码后数据页不应出现明文
-  const raw = fs.read(`/home/u/appdata/secret.awdb`);
-  t('文件为 AWDBVFS1', raw.startsWith(FILE_MAGIC));
+  // 落盘为原始字节(无 base64);数据页不应出现明文
+  const fileBytes = fs.readBinary(`/home/u/appdata/secret.awdb`);
+  t('文件为 Uint8Array', fileBytes instanceof Uint8Array && fileBytes.length > 0);
   let plainLeak = false;
-  try {
-    const bytes = Uint8Array.from(atob(raw.slice(FILE_MAGIC.length)), (ch) => ch.charCodeAt(0));
-    const asText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  if (fileBytes) {
+    const asText = new TextDecoder('utf-8', { fatal: false }).decode(fileBytes);
     if (asText.includes('敏感数据')) plainLeak = true;
-  } catch { /* 忽略 */ }
-  t('整库 base64 内无明文', !plainLeak);
+  }
+  t('整库字节内无明文', !plainLeak);
 
   const pageCount = await storage.pageCount();
   let pageLeak = false;
