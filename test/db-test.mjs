@@ -83,8 +83,9 @@ section('open / 单例', async () => {
   t('至少一个合法超级块', !!(sa || sb));
   t('超级块分页尺寸 4096', (sa || sb).pageSize === PAGE_SIZE);
 
-  // 落在模拟 VFS 的 .awdb:二进制字节,不再 base64 包装
+  // 落在模拟 VFS 的 .awdb:二进制字节 + 宿主随机读写(file-at),不整库缓冲
   t('文件路径带 .awdb', path.endsWith('.awdb'));
+  t('走随机读写后端', storage.kind === 'file-at', storage.kind);
   const raw = fs.readBinary(path);
   t('落盘为二进制页文件', raw instanceof Uint8Array && raw.length > 0);
   t('非 base64 字符串', typeof fs.read(path) !== 'string');

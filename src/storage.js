@@ -3,8 +3,13 @@
  *
  * 库本身**不直连 OPFS**。调用方必须注入后端:
  *   · createMemoryBackend()     内存(单元测试)
- *   · createFileBackend(fs, p)  字节文件(VFS / 模拟 FS / 宿主注入)
+ *   · createFileBackend(fs, p)  经宿主 fs 托管的 .awdb 文件
  *   · 自定义 { readPage, writePages, pageCount }
+ *
+ * createFileBackend **优先使用宿主随机读写**:
+ *   fs.readAt / fs.writeAt / fs.fileSize —— 只读写涉及的页,
+ *   不整库缓冲、不整库回写。
+ * 无 readAt 时退回整文件 read/writeBinary(兼容旧宿主)。
  *
  * open() 未传 storage 时默认 memory(避免误走浏览器私有存储)。
  * ============================================================ */
@@ -58,10 +63,13 @@ export function createMemoryBackend() {
   };
 }
 
-/* ---------- 字节文件后端(VFS / 模拟 FS / OPFS 经宿主注入) ---------- */
+/* ---------- 文件后端(经宿主 fs;优先随机读写) ---------- */
 
 /**
- * @typedef {object} ByteFileFs
+ * @typedef {object} HostFs
+ * @property {(path: string, offset: number, length: number, opts?: object) => Promise<Uint8Array|null>} [readAt]
+ * @property {(path: string, offset: number, data: Uint8Array, opts?: object) => Promise<boolean>} [writeAt]
+ * @property {(path: string, opts?: object) => Promise<number|null>} [fileSize]
  * @property {(path: string, opts?: object) => string|null} [read]
  * @property {(path: string, content: string, opts?: object) => boolean} [write]
  * @property {(path: string, opts?: object) => Uint8Array|null} [readBinary]
@@ -75,20 +83,75 @@ const u8ToB64 = (u8) => {
 };
 const b64ToU8 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
+function hasRandomAccess(fsLike) {
+  return typeof fsLike?.readAt === 'function' && typeof fsLike?.writeAt === 'function';
+}
+
 /**
- * 把分页库存成**二进制文件**(不再 base64 包一层)。
- * 优先 `readBinary`/`writeBinary`;否则退回字符串 read/write,
- * 并兼容旧格式 `FILE_MAGIC + base64`。
+ * 把分页库存成宿主托管的 `.awdb` 文件。
  *
- * @param {ByteFileFs} fsLike
+ * 优先随机访问(只写脏页):
+ *   readPage  → fs.readAt(path, no*PAGE, PAGE)
+ *   writePages → fs.writeAt(path, off, page) 逐页
+ *   pageCount → fs.fileSize / PAGE
+ *
+ * 无 readAt/writeAt 时退回整文件缓冲(兼容旧宿主 / 旧 mock)。
+ *
+ * @param {HostFs} fsLike
  * @param {string} path  建议带 .awdb 扩展名
  * @param {object} [opts] 透传给 fs 的选项(如 { as: user })
  */
 export function createFileBackend(fsLike, path, opts = {}) {
-  if (!fsLike || (typeof fsLike.writeBinary !== 'function' && typeof fsLike.write !== 'function')) {
-    throw new Error('createFileBackend 需要 writeBinary 或 write');
-  }
+  if (!fsLike) throw new Error('createFileBackend 需要宿主 fs');
   if (!path || typeof path !== 'string') throw new Error('createFileBackend 需要文件路径');
+
+  /* ---------- 随机读写路径(首选) ---------- */
+  if (hasRandomAccess(fsLike)) {
+    return {
+      kind: 'file-at',
+      path,
+      async readPage(no) {
+        const out = new Uint8Array(PAGE_SIZE);
+        try {
+          const b = await fsLike.readAt(path, no * PAGE_SIZE, PAGE_SIZE, opts);
+          if (b && b.length) out.set(b.subarray(0, PAGE_SIZE));
+        } catch { /* 缺页 → 全零 */ }
+        return out;
+      },
+      async writePages(startNo, chunks) {
+        for (let i = 0; i < chunks.length; i++) {
+          const off = (startNo + i) * PAGE_SIZE;
+          let ok = false;
+          try {
+            ok = await fsLike.writeAt(path, off, chunks[i], opts);
+          } catch (e) {
+            throw e;
+          }
+          if (!ok) {
+            const err = new Error(`写入失败: ${path} @${off}`);
+            err.name = 'QuotaExceededError';
+            throw err;
+          }
+        }
+      },
+      async pageCount() {
+        try {
+          const sz = typeof fsLike.fileSize === 'function'
+            ? await fsLike.fileSize(path, opts)
+            : 0;
+          return Math.ceil((sz || 0) / PAGE_SIZE);
+        } catch {
+          return 0;
+        }
+      },
+      async close() {},
+    };
+  }
+
+  /* ---------- 整文件回退(无随机访问 API 的旧宿主) ---------- */
+  if (typeof fsLike.readBinary !== 'function' && typeof fsLike.read !== 'function') {
+    throw new Error('createFileBackend 需要 readAt/writeAt 或 read/write');
+  }
 
   let buf = null;
 
@@ -99,7 +162,6 @@ export function createFileBackend(fsLike, path, opts = {}) {
     }
     if (typeof fsLike.read === 'function') {
       const raw = fsLike.read(path, opts);
-      // 旧格式:AWDBVFS1:<base64>
       if (raw && typeof raw === 'string' && raw.startsWith(FILE_MAGIC)) {
         try {
           return b64ToU8(raw.slice(FILE_MAGIC.length));
@@ -116,14 +178,12 @@ export function createFileBackend(fsLike, path, opts = {}) {
     buf = loadBytes();
   }
 
-  /** 把候选缓冲写入文件;成功后由调用方提交 buf */
   async function flushTo(bytes) {
     if (!bytes) return;
     let ok = false;
     if (typeof fsLike.writeBinary === 'function') {
       ok = fsLike.writeBinary(path, bytes, opts);
     } else if (typeof fsLike.write === 'function') {
-      // 仅字符串 FS:仍用旧包装(宿主应优先实现 writeBinary)
       ok = fsLike.write(path, FILE_MAGIC + u8ToB64(bytes), opts);
     }
     if (!ok) {
@@ -147,7 +207,6 @@ export function createFileBackend(fsLike, path, opts = {}) {
     },
     async writePages(startNo, chunks) {
       await ensureLoaded();
-      // 在副本上改,flush 成功才提交到 buf —— 失败不污染已提交页(CoW 依赖)
       const need = (startNo + chunks.length) * PAGE_SIZE;
       const next = need > buf.length ? new Uint8Array(need) : buf.slice();
       if (need > buf.length) next.set(buf);

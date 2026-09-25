@@ -3,8 +3,9 @@
 分页文档数据库:4KB 固定页、双超级块原子提交、可选页级 AES-256-GCM、
 每库操作串行、单条指令原子的集合 CRUD。零依赖 ESM。
 
-**不直连 OPFS** —— 存储必须注入后端(VFS 字符串文件 / 内存 / 自定义);
-webos 生产路径经 `createFileBackend` 写入 `/home/<user>/appdata/<app>.awdb`。
+**经宿主 `fs` 托管的随机读写**:宿主实现 `readAt` / `writeAt` / `fileSize` 时,
+只读写脏页(不整库缓冲);否则退回整文件 read/write。**不直连 OPFS**;
+webos 生产路径 `createFileBackend` → `/home/<user>/appdata/<app>.awdb`。
 
 ## 能力边界(刻意维持)
 
@@ -16,7 +17,7 @@ webos 生产路径经 `createFileBackend` 写入 `/home/<user>/appdata/<app>.awd
 - **页级** AES-256-GCM(每页独立 IV;PBKDF2 密钥 open 时派生一次并缓存)
 - 文档可跨页(加密逻辑 chunk = 4068B;明文 = 4096B)
 - 同名库句柄单例 + 每库 Promise 队列(同文件单线程;异库互不阻塞)
-- 存储:`createFileBackend(fs, path)` / `createMemoryBackend()` / 自定义
+- 存储:`createFileBackend(fs, path)`(优先 `fs.readAt/writeAt` 随机页)/ `createMemoryBackend()` / 自定义
 
 **没有(刻意)**
 
@@ -85,7 +86,8 @@ insert/update/remove
   任一步失败 → 不翻槽,旧 generation 仍完整有效;内存回滚
 ```
 
-字符串/字节文件后端在内存里按页号随机改,flush 时整文件回写(宿主无字节偏移时);优先 `writeBinary` 落**原始字节**。
+CoW 只写脏页:宿主有 `readAt`/`writeAt` 时按页偏移随机写(`writePages` → `fs.writeAt`);
+无随机 API 时退回整文件缓冲回写。
 
 ## 加密
 
@@ -101,7 +103,7 @@ insert/update/remove
 | 方法 | 说明 |
 |---|---|
 | `open(name, { password?, storage? })` | 打开;`storage` 必须是注入后端或 `'memory'`(默认) |
-| `createFileBackend(fs, path, opts?)` | 字节文件后端(优先 `writeBinary`,带 `.awdb` 路径) |
+| `createFileBackend(fs, path, opts?)` | 文件后端:优先 `readAt`/`writeAt` 随机页,否则整文件 |
 | `createMemoryBackend()` | 内存后端(`failWrites` 模拟写失败) |
 | `db.collection(name)` | 集合句柄 |
 | `col.insert / insertMany / get / find / findOne / count` | 增查 |
@@ -119,9 +121,8 @@ node test/db-test.mjs
 # 或 npm test
 ```
 
-测试不依赖 OPFS:`test/mock-webos-fs.mjs` 对齐 webos `fs.js` 的 **inode 式拆分**
-（元数据树无 `d`、内容独立存储，概念上对应 OPFS `fs.v2.json` + `fsdata/`），
-API 为同步 `read/write/mkdir/exists/isDir`；主用例经 `createFileBackend` 走 `.awdb` 路径。
+测试不依赖 OPFS:`test/mock-webos-fs.mjs` 对齐 webos `fs.js`（inode 拆分 + **`readAt`/`writeAt` 随机读写**），
+主用例经 `createFileBackend` 走 `file-at` 后端（只写脏页,不整库回写）。
 
 ## License
 

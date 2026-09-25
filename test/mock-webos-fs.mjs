@@ -192,6 +192,87 @@ export function createMockWebosFs() {
       return this.write(p, bytes, opts);
     },
 
+    /**
+     * 按偏移随机读(对齐 webos fs.readAt)。
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async readAt(p, offset, length, opts) {
+      const n = norm(p);
+      const m = meta.get(n);
+      if (!m || m.t !== 'f') return null;
+      const raw = contents.get(n);
+      if (raw == null) {
+        // 已声明但尚无内容:全零区间(模拟洞)
+        return new Uint8Array(Math.max(0, length | 0));
+      }
+      const bytes = this._toBytes(raw);
+      const off = Math.max(0, offset | 0);
+      const len = Math.max(0, length | 0);
+      if (off >= bytes.length) return new Uint8Array(0);
+      return bytes.slice(off, Math.min(off + len, bytes.length));
+    },
+
+    /**
+     * 按偏移随机写(对齐 webos fs.writeAt)。自动扩文件、标 bin。
+     * @returns {Promise<boolean>}
+     */
+    async writeAt(p, offset, data, opts = {}) {
+      if (this.failWrites) {
+        const err = new Error('storage write failed');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      const n = norm(p);
+      if (!n || n === '/') return false;
+      if (meta.has(n) && meta.get(n) === null) return false;
+      try {
+        ensureParentDirs(n);
+      } catch {
+        return false;
+      }
+      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+      const off = Math.max(0, offset | 0);
+      let cur = contents.has(n) ? this._toBytes(contents.get(n)) : new Uint8Array(0);
+      const need = off + bytes.length;
+      const next = need > cur.length ? new Uint8Array(need) : cur.slice();
+      if (need > cur.length) next.set(cur);
+      next.set(bytes, off);
+      contents.set(n, next);
+      if (!meta.has(n) || meta.get(n)?.t !== 'f') {
+        meta.set(n, { t: 'f', m: Date.now(), o: 'root', p: 'rw-r--' });
+      }
+      const node = meta.get(n);
+      node.bin = true;
+      node.s = next.length;
+      node.m = Date.now();
+      return true;
+    },
+
+    /** 文件字节数(对齐 webos fs.fileSize) */
+    async fileSize(p, opts) {
+      const raw = this.read(p, opts);
+      if (raw == null) {
+        const n = norm(p);
+        const m = meta.get(n);
+        if (!m || m.t !== 'f') return null;
+        return 0;
+      }
+      return this._toBytes(raw).length;
+    },
+
+    _toBytes(raw) {
+      if (raw instanceof Uint8Array) return raw;
+      if (typeof raw === 'string') {
+        if (raw.startsWith('AWDBVFS1:')) {
+          try {
+            return Uint8Array.from(atob(raw.slice(9)), (c) => c.charCodeAt(0));
+          } catch { /* UTF-8 */ }
+        }
+        return new TextEncoder().encode(raw);
+      }
+      return new Uint8Array(0);
+    },
+
     /** 删文件;目录返回 false(简化) */
     rm(p) {
       const n = norm(p);
