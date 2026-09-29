@@ -10,6 +10,14 @@
  * ============================================================ */
 
 export { open, Database, Collection, closeAll } from './database.js';
+export { parse as parseSql, runSql } from './sql.js';
+export {
+  typeOf,
+  normalizeSchema,
+  checkDoc,
+  applyDefaults,
+  absorbDoc,
+} from './schema.js';
 export {
   createMemoryBackend,
   createFileBackend,
@@ -37,6 +45,8 @@ export {
 } from './crypto.js';
 
 import { open, Database, Collection, closeAll } from './database.js';
+import { parse as parseSql, runSql } from './sql.js';
+import { typeOf, normalizeSchema, checkDoc, applyDefaults, absorbDoc } from './schema.js';
 import {
   createMemoryBackend,
   createFileBackend,
@@ -52,6 +62,13 @@ const AetherWebDatabase = {
   Database,
   Collection,
   closeAll,
+  parseSql,
+  runSql,
+  typeOf,
+  normalizeSchema,
+  checkDoc,
+  applyDefaults,
+  absorbDoc,
   createMemoryBackend,
   createFileBackend,
   openBackend,

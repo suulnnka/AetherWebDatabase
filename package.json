@@ -1,18 +1,20 @@
 {
   "name": "aether-webdatabase",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "分页文档数据库:4KB 页、双超级块原子提交、可选页级 AES-GCM;不直连 OPFS,存储经注入后端(.awdb 字符串文件/内存)",
+  "description": "分页文档数据库:4KB 页、双超级块原子提交、可选页级 AES-GCM、schema 校验与自动演化、物化内存执行的只读 SQL SELECT;不直连 OPFS,存储经注入后端(.awdb 字符串文件/内存)",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./crypto": "./src/crypto.js",
     "./storage": "./src/storage.js",
     "./database": "./src/database.js",
-    "./page": "./src/page.js"
+    "./page": "./src/page.js",
+    "./sql": "./src/sql.js",
+    "./schema": "./src/schema.js"
   },
   "scripts": {
-    "test": "node test/db-test.mjs"
+    "test": "node test/db-test.mjs && node test/schema-test.mjs && node test/sql-test.mjs"
   },
   "license": "MIT",
   "repository": {
@@ -29,7 +31,11 @@
     "webos",
     "vfs",
     "分页",
-    "文档库"
+    "文档库",
+    "sql",
+    "join",
+    "schema",
+    "materialize"
   ],
   "sideEffects": false,
   "private": false

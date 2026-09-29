@@ -23,6 +23,15 @@ import {
 } from './page.js';
 import { deriveKey, randomSalt, encryptPage, decryptPage } from './crypto.js';
 import { openBackend } from './storage.js';
+import {
+  normalizeSchema,
+  checkDoc,
+  checkRequired,
+  applyDefaults,
+  stripUnknown,
+  absorbDoc,
+} from './schema.js';
+import { runSql } from './sql.js';
 
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -55,6 +64,35 @@ function stripId(patch) {
 
 function emptyCatalog() {
   return { free: [], cols: {} };
+}
+
+/** find/count 共用的排序 + 分页(对内存数组就地处理) */
+function applySortPage(list, opts) {
+  if (opts.sort != null) {
+    let field;
+    let desc = false;
+    if (typeof opts.sort === 'string') field = opts.sort;
+    else if (opts.sort === -1 || opts.sort === 1) desc = opts.sort === -1;
+    else if (typeof opts.sort === 'object' && opts.sort) {
+      field = Object.keys(opts.sort)[0];
+      desc = opts.sort[field] === -1;
+    } else field = String(opts.sort);
+    if (field) {
+      list.sort((a, b) => {
+        const x = a[field];
+        const y = b[field];
+        if (x === y) return 0;
+        if (x == null) return 1;
+        if (y == null) return -1;
+        const c = x < y ? -1 : x > y ? 1 : 0;
+        return desc ? -c : c;
+      });
+    }
+  }
+  const offset = Math.max(0, opts.offset | 0);
+  const limit = opts.limit == null ? -1 : Math.max(0, opts.limit | 0);
+  if (offset || limit >= 0) return list.slice(offset, limit >= 0 ? offset + limit : undefined);
+  return list;
 }
 
 function padPlain(logical) {
@@ -156,6 +194,47 @@ export class Collection {
     return JSON.parse(td.decode(bytes));
   }
 
+  /** 写入口 schema 管线:strict 校验 / auto 吸收(随本次事务落盘)+ 补默认值 + 必填检查 */
+  #schemaPass(col, doc) {
+    const sc = col.schema;
+    if (!sc) return;
+    if (sc.mode === 'auto') {
+      const errs = absorbDoc(doc, sc);
+      if (errs.length) throw new Error(`schema 校验失败(${this.#name}): ${errs.join('; ')}`);
+      applyDefaults(doc, sc);
+      const rerrs = checkRequired(doc, sc);
+      if (rerrs.length) throw new Error(`schema 校验失败(${this.#name}): ${rerrs.join('; ')}`);
+    } else {
+      const errs = checkDoc(doc, sc);
+      if (errs.length) throw new Error(`schema 校验失败(${this.#name}): ${errs.join('; ')}`);
+      if (sc.extra === 'strip') stripUnknown(doc, sc);
+      applyDefaults(doc, sc);
+    }
+  }
+
+  /** 本集合发生写入 → 物化缓存失效(SQL/物化路径下次重建) */
+  #invalidate() {
+    this.#db._mat.delete(this.#name);
+  }
+
+  /**
+   * 整集合物化为内存数组(SQL 查询的数据源)。
+   * 只读场景缓存永久有效;写入该集合即失效。返回数组为库内部对象,
+   * 调用方只读使用(修改请走 update 系列)。
+   */
+  loadAll() {
+    return this.#db._read(async () => {
+      if (this.#db._mat.has(this.#name)) return this.#db._mat.get(this.#name);
+      const col = this.#col(false);
+      const out = [];
+      if (col) {
+        for (const meta of Object.values(col.docs)) out.push(await this.#readDoc(meta));
+      }
+      this.#db._mat.set(this.#name, out);
+      return out;
+    });
+  }
+
   #nextId(col, explicit) {
     if (explicit != null) return String(explicit);
     col.seq += 1;
@@ -171,9 +250,11 @@ export class Collection {
         const d = clone(doc);
         d.id = this.#nextId(col, d.id);
         if (col.docs[d.id]) throw new Error(`id 已存在: ${d.id}`);
+        this.#schemaPass(col, d);
         const bytes = te.encode(JSON.stringify(d));
         col.docs[d.id] = this.#storeDoc(txn, bytes);
         await this.#db._commit(txn);
+        this.#invalidate();
         return clone(d);
       } catch (e) {
         txn.rollback();
@@ -191,17 +272,19 @@ export class Collection {
         const col = this.#col(true);
         const pending = [];
         const seen = new Set();
-        for (const doc of docs) {
-          const d = clone(doc);
-          d.id = this.#nextId(col, d.id);
-          if (seen.has(d.id) || col.docs[d.id]) throw new Error(`id 已存在: ${d.id}`);
-          seen.add(d.id);
-          pending.push(d);
+        for (const d of docs) {
+          const dd = clone(d);
+          dd.id = this.#nextId(col, dd.id);
+          if (seen.has(dd.id) || col.docs[dd.id]) throw new Error(`id 已存在: ${dd.id}`);
+          seen.add(dd.id);
+          this.#schemaPass(col, dd);
+          pending.push(dd);
         }
         for (const d of pending) {
           col.docs[d.id] = this.#storeDoc(txn, te.encode(JSON.stringify(d)));
         }
         await this.#db._commit(txn);
+        this.#invalidate();
         return pending.map(clone);
       } catch (e) {
         txn.rollback();
@@ -223,36 +306,20 @@ export class Collection {
     return this.#db._read(async () => {
       const col = this.#col(false);
       if (!col) return [];
-      let list = [];
-      for (const meta of Object.values(col.docs)) {
-        const doc = await this.#readDoc(meta);
-        if (match(doc, filter)) list.push(doc);
-      }
-      if (opts.sort != null) {
-        let field;
-        let desc = false;
-        if (typeof opts.sort === 'string') field = opts.sort;
-        else if (opts.sort === -1 || opts.sort === 1) desc = opts.sort === -1;
-        else if (typeof opts.sort === 'object' && opts.sort) {
-          field = Object.keys(opts.sort)[0];
-          desc = opts.sort[field] === -1;
-        } else field = String(opts.sort);
-        if (field) {
-          list.sort((a, b) => {
-            const x = a[field];
-            const y = b[field];
-            if (x === y) return 0;
-            if (x == null) return 1;
-            if (y == null) return -1;
-            const c = x < y ? -1 : x > y ? 1 : 0;
-            return desc ? -c : c;
-          });
+      let list;
+      if (this.#db._mat.has(this.#name)) {
+        const mat = this.#db._mat.get(this.#name);
+        list = filter == null ? [...mat] : mat.filter((d) => match(d, filter));
+      } else {
+        list = [];
+        for (const meta of Object.values(col.docs)) {
+          const doc = await this.#readDoc(meta);
+          if (match(doc, filter)) list.push(doc);
         }
       }
-      const offset = Math.max(0, opts.offset | 0);
-      const limit = opts.limit == null ? -1 : Math.max(0, opts.limit | 0);
-      if (offset || limit >= 0) list = list.slice(offset, limit >= 0 ? offset + limit : undefined);
-      return list;
+      list = applySortPage(list, opts);
+      /* 页路径每次 find 都重新 JSON.parse(天然独立);物化路径共享内部对象,须深拷贝 */
+      return list.map(clone);
     });
   }
 
@@ -260,6 +327,10 @@ export class Collection {
     return this.#db._read(async () => {
       const col = this.#col(false);
       if (!col) return null;
+      if (this.#db._mat.has(this.#name)) {
+        const hit = this.#db._mat.get(this.#name).find((d) => match(d, filter));
+        return hit ? clone(hit) : null;
+      }
       for (const meta of Object.values(col.docs)) {
         const doc = await this.#readDoc(meta);
         if (match(doc, filter)) return doc;
@@ -273,6 +344,9 @@ export class Collection {
       const col = this.#col(false);
       if (!col) return 0;
       if (filter == null) return Object.keys(col.docs).length;
+      if (this.#db._mat.has(this.#name)) {
+        return this.#db._mat.get(this.#name).reduce((n, d) => (match(d, filter) ? n + 1 : n), 0);
+      }
       let n = 0;
       for (const meta of Object.values(col.docs)) {
         if (match(await this.#readDoc(meta), filter)) n++;
@@ -295,9 +369,11 @@ export class Collection {
         }
         const cur = await this.#readDoc(oldMeta);
         const next = { ...cur, ...clone(stripId(patch)), id: key };
+        this.#schemaPass(col, next);
         this.#freeDoc(txn, oldMeta);
         col.docs[key] = this.#storeDoc(txn, te.encode(JSON.stringify(next)));
         await this.#db._commit(txn);
+        this.#invalidate();
         return next;
       } catch (e) {
         txn.rollback();
@@ -320,7 +396,11 @@ export class Collection {
         const rewrites = [];
         for (const [key, meta] of Object.entries(col.docs)) {
           const cur = await this.#readDoc(meta);
-          if (match(cur, filter)) rewrites.push({ key, meta, next: { ...cur, ...rest, id: key } });
+          if (match(cur, filter)) {
+            const next = { ...cur, ...rest, id: key };
+            this.#schemaPass(col, next);
+            rewrites.push({ key, meta, next });
+          }
         }
         if (!rewrites.length) {
           txn.rollback();
@@ -331,6 +411,7 @@ export class Collection {
           col.docs[key] = this.#storeDoc(txn, te.encode(JSON.stringify(next)));
         }
         await this.#db._commit(txn);
+        this.#invalidate();
         return rewrites.length;
       } catch (e) {
         txn.rollback();
@@ -353,6 +434,7 @@ export class Collection {
         this.#freeDoc(txn, meta);
         delete col.docs[key];
         await this.#db._commit(txn);
+        this.#invalidate();
         return true;
       } catch (e) {
         txn.rollback();
@@ -383,6 +465,7 @@ export class Collection {
           delete col.docs[key];
         }
         await this.#db._commit(txn);
+        this.#invalidate();
         return kills.length;
       } catch (e) {
         txn.rollback();
@@ -405,7 +488,81 @@ export class Collection {
         col.docs = {};
         col.seq = 0;
         await this.#db._commit(txn);
+        this.#invalidate();
         return n;
+      } catch (e) {
+        txn.rollback();
+        throw e;
+      }
+    });
+  }
+
+  /* ---- schema ---- */
+
+  /**
+   * 替换集合 schema(宽松变更,等价 ALTER TABLE):
+   * strict 模式默认先扫描存量文档校验(不一致即报错回滚,传 scan:false 跳过);
+   * auto 模式不扫(演化式,存量不动)。fields 传 null 可移除 schema。
+   */
+  setSchema(fields, opts = {}) {
+    return this.#db._write(async () => {
+      const txn = new Txn(this.#db);
+      try {
+        const col = this.#col(false);
+        if (!col) throw new Error(`集合不存在: ${this.#name}`);
+        const sc = fields == null ? null : normalizeSchema(fields, opts);
+        let scanned = 0;
+        if (sc && sc.mode !== 'auto' && opts.scan !== false) {
+          for (const [key, meta] of Object.entries(col.docs)) {
+            const doc = JSON.parse(td.decode(await this.#db._readBytes(meta)));
+            const errs = checkDoc(doc, sc);
+            if (errs.length) throw new Error(`文档 ${key} 不符合新 schema: ${errs.join('; ')}`);
+            scanned++;
+          }
+        }
+        if (sc) col.schema = sc;
+        else delete col.schema;
+        await this.#db._commit(txn);
+        return scanned;
+      } catch (e) {
+        txn.rollback();
+        throw e;
+      }
+    });
+  }
+
+  /**
+   * 迁移 schema(破坏性变更):单事务内重读全集合 → run(doc) 逐文档变换 →
+   * 按新 schema 严格校验 → 全量重写落盘(等价 setPassword 的紧凑重写机制)。
+   * run 不得改 id;version 记入集合元数据 schemaV。
+   */
+  migrateSchema({ fields, mode, extra, version, run }) {
+    return this.#db._write(async () => {
+      const txn = new Txn(this.#db);
+      try {
+        const col = this.#col(false);
+        if (!col) throw new Error(`集合不存在: ${this.#name}`);
+        const sc = normalizeSchema(fields ?? {}, { mode, extra });
+        const rewrites = [];
+        for (const [key, meta] of Object.entries(col.docs)) {
+          const cur = await this.#readDoc(meta);
+          const next = run ? await run(clone(cur)) : clone(cur);
+          ensureDocShape(next);
+          next.id = key;
+          const errs = checkDoc(next, sc);
+          if (errs.length) throw new Error(`迁移后文档 ${key} 不符合新 schema: ${errs.join('; ')}`);
+          applyDefaults(next, sc);
+          rewrites.push({ key, meta, next });
+        }
+        for (const { key, meta, next } of rewrites) {
+          this.#freeDoc(txn, meta);
+          col.docs[key] = this.#storeDoc(txn, te.encode(JSON.stringify(next)));
+        }
+        col.schema = sc;
+        if (version != null) col.schemaV = version;
+        await this.#db._commit(txn);
+        this.#invalidate();
+        return rewrites.length;
       } catch (e) {
         txn.rollback();
         throw e;
@@ -432,6 +589,8 @@ export class Database {
   _chunk = CHUNK_PLAIN;
   /** 读缓存:页号 → 逻辑页(提交后清空) */
   _pageCache = new Map();
+  /** 集合物化缓存:集合名 → 文档数组(SQL 查询源;写该集合即失效) */
+  _mat = new Map();
 
   constructor(name, init = {}) {
     this.#name = name;
@@ -468,6 +627,39 @@ export class Database {
     return new Collection(this, name);
   }
 
+  /**
+   * 建集合(幂等):不存在则建空集合并落盘,已存在则仅在传入 schema 时更新之。
+   * opts:{ schema?: 字段声明, mode?: 'strict'|'auto', extra?: 'reject'|'allow'|'strip' }
+   */
+  async createCollection(name, opts = {}) {
+    return this._write(async () => {
+      if (!name || typeof name !== 'string') throw new Error('集合名必须是非空字符串');
+      this._assertOpen();
+      const txn = new Txn(this);
+      try {
+        let col = this._cat.cols[name];
+        if (!col) col = this._cat.cols[name] = { seq: 0, docs: {} };
+        if (opts.schema != null || opts.mode != null || opts.extra != null) {
+          col.schema = normalizeSchema(opts.schema ?? {}, opts);
+        }
+        await this._commit(txn);
+        return this.collection(name);
+      } catch (e) {
+        txn.rollback();
+        throw e;
+      }
+    });
+  }
+
+  /**
+   * SQL 查询(只读 SELECT;数据经集合物化,首次查询触发 loadAll)。
+   * @param {string} text SQL 文本(? 为占位参数)
+   * @param {Array} [params] 参数按序绑定
+   */
+  sql(text, params = []) {
+    return runSql(this, text, params);
+  }
+
   listCollections() {
     return this._read(() => Object.keys(this._cat.cols).sort());
   }
@@ -483,6 +675,7 @@ export class Database {
         }
         for (const meta of Object.values(col.docs)) this.#freeMeta(txn, meta);
         delete this._cat.cols[name];
+        this._mat.delete(name);
         await this._commit(txn);
         return true;
       } catch (e) {
@@ -564,6 +757,7 @@ export class Database {
           pageCount: cursor,
         });
         this._pageCache.clear();
+        this._mat.clear();
         return true;
       } catch (e) {
         txn.rollback();
@@ -627,6 +821,7 @@ export class Database {
           }
         }
         await this._commit(txn);
+        this._mat.clear();
         return true;
       } catch (e) {
         txn.rollback();
@@ -661,6 +856,7 @@ export class Database {
         pageCount: cursor,
       });
       this._pageCache.clear();
+      this._mat.clear();
       this.#closed = true;
       return true;
     });
