@@ -1,8 +1,8 @@
 # AetherWebDatabase
 
-分页文档数据库:4KB 固定页、双超级块原子提交、可选页级 AES-256-GCM、
-每库操作串行、单条指令原子的集合 CRUD、写入校验的集合 schema(可自动演化)、
-物化内存执行的只读 SQL SELECT。零依赖 ESM。
+分页文档数据库:4KB 固定页、双超级块原子提交、**目录 delta 链增量提交**、
+可选页级 AES-256-GCM、每库操作串行、单条指令原子的集合 CRUD、
+写入校验的集合 schema(可自动演化)、物化内存执行的只读 SQL SELECT。零依赖 ESM。
 
 **经宿主 `fs` 托管的随机读写**:宿主实现 `readAt` / `writeAt` / `fileSize` 时,
 只读写脏页(不整库缓冲);否则退回整文件 read/write。**不直连 OPFS**;
@@ -14,6 +14,9 @@ webos 生产路径 `createFileBackend` → `/home/<user>/appdata/<app>.awdb`。
 
 - 一个「数据库文件」= **带 `.awdb` 扩展名**的文件,固定 **4096B 页**
 - page0/1 **双超级块**(CRC + generation),CoW 写脏页后翻转另一槽 → 单指令原子
+- **目录 delta 链**:小改动每笔只落盘一页目录差异(恒定,不随库大小增长),
+  链满 32 / 单笔差异过大 / 回放自检不过 → 全量 checkpoint 并回收旧链页;
+  打开时基准快照 + 逐个重放 delta 还原目录(与旧版整目录文件兼容)
 - 多集合文档库:`insert / get / find / update / remove` 系列
 - **页级** AES-256-GCM(每页独立 IV;PBKDF2 密钥 open 时派生一次并缓存)
 - 文档可跨页(加密逻辑 chunk = 4068B;明文 = 4096B)
@@ -80,17 +83,34 @@ const m2 = await open('t2');
 **数据页(明文):** 逻辑载荷零填充到 4096B。
 
 **目录 JSON:** `p` = 页号列表,`n` = 文档 UTF-8 字节长。
+超级块的 `catalogStart/Pages/ByteLen` 指向**目录链头**:
+全量快照(旧格式)或 delta 记录 `{"d":1,"prev":{s,p,l},…差异}`,沿 `prev`
+回溯到快照即为完整目录。
 
-## 原子提交(CoW)
+## 原子提交(CoW + 目录 delta 链)
 
 ```
 insert/update/remove
-  → 备份目录 JSON
-  → 分配页(free 或文件尾)并只写「旧超级块未引用」的页
-  → 写新目录页
-  → generation+1 写入另一超级块槽
+  → 备份目录 JSON(CoW 基准)
+  → 分配页(free 或文件尾)写文档页 —— 事务内释放的页推迟入 free 链,
+    旧 generation 仍引用它们,同事务复用会撕毁回退目标(不可)
+  → 计算目录差异(delta:集合壳 / 文档条目 / free 链增减)
+      小差异 → delta 页落盘,链头前移(prev 指旧头)
+      链满 32 / 差异超 16 页 / 基准代过期 / 回放自检不过
+        → checkpoint:全量目录落盘,旧链页(基准 + 全部 delta)回收
+  → generation+1 超级块指向新链头,翻转另一槽
   任一步失败 → 不翻槽,旧 generation 仍完整有效;内存回滚
 ```
+
+- **提交点仍是超级块翻槽**:delta 页先落盘、翻槽最后,断电任一瞬间的
+  语义与全量提交完全一致(翻槽前 = 未提交,翻槽后 = 完整提交)。
+- **每笔目录开销恒定 1 页**:不随文档总数增长(全量目录方案随库线性);
+  摊销后每笔 ≈ 目录大小 / 33。实测 200 文档库单笔 update 12KB
+  (文档页 4 + delta 4 + 超级块 4),旧全量目录 16KB 且随规模恶化。
+- **打开恢复**:超级块 → 链头 → 沿 prev 回溯到基准快照 → 逐个重放 delta。
+  形状非法 / 循环 / 解析失败 → 「目录链损坏」报错,绝不静默成空库。
+- **旧版文件兼容**:旧文件的链头就是整目录快照(prev 不存在),照常打开,
+  下一笔提交自然转成 delta 链。
 
 CoW 只写脏页:宿主有 `readAt`/`writeAt` 时按页偏移随机写(`writePages` → `fs.writeAt`);
 无随机 API 时退回整文件缓冲回写。
@@ -189,7 +209,7 @@ const rows = await db.sql(
 ## 测试(Node 模拟 webos FS)
 
 ```bash
-node test/db-test.mjs      # CRUD / 原子回滚 / 加密 / 单例串行
+node test/db-test.mjs      # CRUD / 原子回滚 / 加密 / 单例串行 / delta 链重放与崩溃
 node test/schema-test.mjs  # schema 校验 / auto 演化 / 迁移 / 物化失效
 node test/sql-test.mjs     # SQL 查询 / join / 子查询 / 5 万条基准
 # 或 npm test

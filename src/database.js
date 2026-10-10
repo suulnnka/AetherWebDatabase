@@ -5,6 +5,11 @@
  *   · 一个库 = 一个 `.awdb` 文件,固定 4096B 页(注入后端承载);
  *   · page0/1 双超级块(CRC + generation),写脏页后翻转另一槽 → 单指令原子;
  *   · 目录 JSON(free + cols)存连续数据页;文档 UTF-8 字节按 chunk 分片;
+ *   · 提交走 delta 链:小改动只写一页目录差异(基准快照 + 至多
+ *     DELTA_CHAIN_MAX 个 delta,链满 / 差异过大 / 回放校验不过 → 全量
+ *     checkpoint 并回收旧链页)。打开时基准 + 逐个重放 delta 还原目录;
+ *   · 事务内释放的页推迟到提交末尾入 free 链:旧代仍引用,同事务
+ *     复用会破坏回退到的旧 generation(CoW 不变量);
  *   · 可选页级 AES-GCM(密钥 open 时 PBKDF2 一次并缓存);
  *   · 同名库句柄单例 + 每库 Promise 队列;无视图、无跨语句事务。
  * ============================================================ */
@@ -119,6 +124,12 @@ class Txn {
     this.catalogJson = JSON.stringify(db._cat);
     /** 页号 → 逻辑载荷 */
     this.dirty = new Map();
+    /**
+     * 本事务释放的页,推迟到提交末尾(commitFreed)才入 free 链:
+     * 落盘前旧 generation 仍引用这些页,同事务内 alloc 复用会把
+     * 旧代引用的页覆写成新内容 —— 崩溃回退到旧代即读到脏数据。
+     */
+    this.freed = [];
     this.extendedTo = db._pageCount;
   }
 
@@ -138,7 +149,29 @@ class Txn {
 
   free(pages) {
     for (const p of pages) {
-      if (p >= FIRST_DATA_PAGE) this.cat.free.push(p);
+      if (p >= FIRST_DATA_PAGE) this.freed.push(p);
+    }
+  }
+
+  /** 预览:释放页并入后的 free 链(不改目录) */
+  previewFree() {
+    if (!this.freed.length) return this.cat.free;
+    const seen = new Set(this.cat.free);
+    const out = this.cat.free.slice();
+    for (const p of this.freed) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  /** 释放页正式入链;此后本事务不得再 alloc(会复用刚释放的页) */
+  commitFreed() {
+    if (this.freed.length) {
+      this.cat.free = this.previewFree();
+      this.freed = [];
     }
   }
 
@@ -149,7 +182,128 @@ class Txn {
   rollback() {
     this.db._cat = JSON.parse(this.catalogJson);
     this.dirty.clear();
+    this.freed = [];
   }
+}
+
+/* ---------- 目录 delta(diff / 重放) ---------- */
+
+/** 链上 delta 数达到即 checkpoint */
+const DELTA_CHAIN_MAX = 32;
+/** 单个 delta 超过该页数 → 直接 checkpoint(大操作摊不摊销都一样) */
+const DELTA_MAX_PAGES = 16;
+
+/** 文档元数据相等(页列表 + 字节长) */
+function metaEq(a, b) {
+  return a.n === b.n
+    && Array.isArray(a.p) && Array.isArray(b.p)
+    && a.p.length === b.p.length
+    && a.p.every((v, i) => v === b.p[i]);
+}
+
+/** 集合壳:除 docs 外的全部字段(seq / schema / schemaV …) */
+function colShell(col) {
+  const { docs: _docs, ...rest } = col;
+  return clone(rest);
+}
+
+/**
+ * 目录差异:oldCat → newCat。
+ *   cols: 新建或壳变(seq/schema/schemaV…)的集合 → 壳对象;删除 → null
+ *   docs: { 集合名: { id: 新 meta | null(删除) } }
+ *   fa / fr: free 链消耗 / 新增(集合语义;顺序只影响后续分配选择,不影响正确性)
+ * 与 applyDelta 互逆。
+ */
+function diffCatalog(oldCat, newCat) {
+  const delta = {};
+  const cols = {};
+  for (const [name, nc] of Object.entries(newCat.cols)) {
+    const oc = oldCat.cols[name];
+    if (!oc) cols[name] = colShell(nc);
+    else if (!deepEq(colShell(oc), colShell(nc))) cols[name] = colShell(nc);
+  }
+  for (const name of Object.keys(oldCat.cols)) {
+    if (!(name in newCat.cols)) cols[name] = null;
+  }
+  const docs = {};
+  for (const [name, nc] of Object.entries(newCat.cols)) {
+    const oc = oldCat.cols[name];
+    if (!oc) {
+      // 新建集合:文档条目随 delta 带上(壳里不含)
+      const d = {};
+      for (const [id, m] of Object.entries(nc.docs)) d[id] = m;
+      if (Object.keys(d).length) docs[name] = d;
+      continue;
+    }
+    const d = {};
+    for (const [id, m] of Object.entries(nc.docs)) {
+      const om = oc.docs[id];
+      if (!om || !metaEq(om, m)) d[id] = m;
+    }
+    for (const id of Object.keys(oc.docs)) {
+      if (!(id in nc.docs)) d[id] = null;
+    }
+    if (Object.keys(d).length) docs[name] = d;
+  }
+  const oFree = new Set(oldCat.free);
+  const nFree = new Set(newCat.free);
+  const fa = oldCat.free.filter((p) => !nFree.has(p));
+  const fr = newCat.free.filter((p) => !oFree.has(p));
+  if (Object.keys(cols).length) delta.cols = cols;
+  if (Object.keys(docs).length) delta.docs = docs;
+  if (fa.length) delta.fa = fa;
+  if (fr.length) delta.fr = fr;
+  return delta;
+}
+
+/**
+ * 重放:基准目录 + delta → 新目录(就地修改并返回)。
+ * 形状非法(损坏页恰好解析成 JSON)→ 抛「目录链损坏」。
+ */
+function applyDelta(cat, delta) {
+  if (!cat || typeof cat !== 'object' || !cat.cols
+    || !delta || typeof delta !== 'object') {
+    throw new Error('目录链损坏: 记录形状非法');
+  }
+  if (delta.cols) {
+    for (const [name, shell] of Object.entries(delta.cols)) {
+      if (shell == null) {
+        delete cat.cols[name];
+        continue;
+      }
+      if (typeof shell !== 'object') throw new Error('目录链损坏: 集合壳非法');
+      const docs = cat.cols[name]?.docs ?? {};
+      cat.cols[name] = { ...clone(shell), docs };
+    }
+  }
+  if (delta.docs) {
+    for (const [name, entries] of Object.entries(delta.docs)) {
+      if (!entries || typeof entries !== 'object') throw new Error('目录链损坏: 文档条目非法');
+      let col = cat.cols[name];
+      if (!col) col = cat.cols[name] = { seq: 0, docs: {} };
+      for (const [id, m] of Object.entries(entries)) {
+        if (m == null) delete col.docs[id];
+        else if (m && typeof m === 'object' && Array.isArray(m.p) && Number.isFinite(m.n)) {
+          col.docs[id] = clone(m);
+        } else throw new Error('目录链损坏: 文档元数据非法');
+      }
+    }
+  }
+  if (Array.isArray(delta.fa) && delta.fa.length) {
+    const dead = new Set(delta.fa);
+    cat.free = cat.free.filter((p) => !dead.has(p));
+  }
+  if (Array.isArray(delta.fr) && delta.fr.length) {
+    const have = new Set(cat.free);
+    for (const p of delta.fr) {
+      if (!Number.isInteger(p) || p < FIRST_DATA_PAGE) throw new Error('目录链损坏: 页号非法');
+      if (!have.has(p)) {
+        have.add(p);
+        cat.free.push(p);
+      }
+    }
+  }
+  return cat;
 }
 
 /* ---------- Collection ---------- */
@@ -587,6 +741,11 @@ export class Database {
   _cat = emptyCatalog();
   _pageCount = 2;
   _chunk = CHUNK_PLAIN;
+  /**
+   * 目录链: [{ s, p, l }] 按旧→新排列;[0] 为基准快照,其余为 delta。
+   * 超级块的 catalogStart/Pages/ByteLen 指向链头;checkpoint 时整链回收。
+   */
+  _chain = [];
   /** 读缓存:页号 → 逻辑页(提交后清空) */
   _pageCache = new Map();
   /** 集合物化缓存:集合名 → 文档数组(SQL 查询源;写该集合即失效) */
@@ -603,6 +762,7 @@ export class Database {
     this._chunk = init.chunk ?? CHUNK_PLAIN;
     this._pageCount = init.pageCount ?? FIRST_DATA_PAGE;
     this._lastSlot = init.lastSlot ?? null;
+    this._chain = init.chain ?? [];
   }
 
   get name() {
@@ -696,6 +856,11 @@ export class Database {
   setPassword(newPassword) {
     return this._write(async () => {
       const txn = new Txn(this);
+      // 密钥态先备份:切换发生在提交前,失败须还原(目录由 rollback 还原)
+      const oldKey = this.#key;
+      const oldSalt = this.#salt;
+      const oldPass = this.#password;
+      const oldChunk = this._chunk;
       try {
         // 1) 备份集合壳 + 读出全部文档明文字节
         const colNames = Object.keys(this._cat.cols);
@@ -709,7 +874,15 @@ export class Database {
           }
         }
 
-        // 2) 切换密钥 / chunk
+        // 2) 旧代页全部释放(文档页 + 目录链);推迟入链,同事务不复用
+        for (const cname of colNames) {
+          for (const meta of Object.values(this._cat.cols[cname].docs)) this.#freeMeta(txn, meta);
+        }
+        for (const loc of this._chain) {
+          for (let i = 0; i < loc.p; i++) txn.free([loc.s + i]);
+        }
+
+        // 3) 切换密钥 / chunk
         const pass = newPassword ?? null;
         if (pass != null) {
           this.#salt = randomSalt();
@@ -722,22 +895,18 @@ export class Database {
         }
         this.#password = pass;
 
-        // 3) 紧凑重写:free 清空,页从 FIRST_DATA 重排
+        // 4) 紧凑重写:新密态下全部页经 txn.alloc 放置(不覆写旧代
+        //    仍引用的页 —— 旧实现从页 2 起原地重排,翻槽前崩溃会撕毁旧代)
         this._cat = emptyCatalog();
-        txn.dirty.clear();
-        let cursor = FIRST_DATA_PAGE;
         const place = (bytes) => {
           const need = pagesNeeded(bytes.length, this._chunk);
-          const pages = [];
+          const pages = txn.alloc(need);
           for (let i = 0; i < need; i++) {
             const start = i * this._chunk;
-            pages.push(cursor);
-            txn.setDirty(cursor, bytes.subarray(start, start + this._chunk));
-            cursor++;
+            txn.setDirty(pages[i], bytes.subarray(start, start + this._chunk));
           }
           return pages;
         };
-
         for (const cname of colNames) {
           this._cat.cols[cname] = { seq: seqOf[cname] ?? 0, docs: {} };
         }
@@ -745,21 +914,27 @@ export class Database {
           this._cat.cols[cname].docs[id] = { p: place(bytes), n: bytes.length };
         }
 
-        // 4) 目录页
-        const catBytes = te.encode(JSON.stringify(this._cat));
+        // 5) 目录页:字节按释放页并入后的形态序列化,页仍从旧 free 链分配
+        const catBytes = te.encode(JSON.stringify({ ...this._cat, free: txn.previewFree() }));
         const catPages = place(catBytes);
-        const catalogStart = catPages[0];
-
+        txn.commitFreed();
+        let pageCount = txn.extendedTo;
+        for (const p of txn.dirty.keys()) pageCount = Math.max(pageCount, p + 1);
         await this._commitLayout(txn, {
-          catalogStart,
+          catalogStart: catPages[0],
           catalogPages: catPages.length,
           catalogByteLen: catBytes.length,
-          pageCount: cursor,
+          pageCount,
         });
+        this._chain = [{ s: catPages[0], p: catPages.length, l: catBytes.length }];
         this._pageCache.clear();
         this._mat.clear();
         return true;
       } catch (e) {
+        this.#key = oldKey;
+        this.#salt = oldSalt;
+        this.#password = oldPass;
+        this._chunk = oldChunk;
         txn.rollback();
         throw e;
       }
@@ -830,35 +1005,49 @@ export class Database {
     });
   }
 
-  /** 删除库:写入空明文库并关闭(清除加密态) */
+  /** 删除库:写入空明文库并关闭(清除加密态);旧代页入 free 链供后续复用 */
   drop() {
     return this._write(async () => {
-      // 读出空壳,强制转明文紧凑重建
       this.#password = null;
       this.#key = null;
       this.#salt = new Uint8Array(16);
       this._chunk = CHUNK_PLAIN;
-      this._cat = emptyCatalog();
-      this._pageCache.clear();
 
       const txn = new Txn(this);
-      const catBytes = te.encode(JSON.stringify(this._cat));
-      const need = pagesNeeded(catBytes.length, this._chunk);
-      let cursor = FIRST_DATA_PAGE;
-      for (let i = 0; i < need; i++) {
-        txn.setDirty(cursor, catBytes.subarray(i * this._chunk, (i + 1) * this._chunk));
-        cursor++;
+      try {
+        for (const col of Object.values(this._cat.cols)) {
+          for (const meta of Object.values(col.docs)) this.#freeMeta(txn, meta);
+        }
+        for (const loc of this._chain) {
+          for (let i = 0; i < loc.p; i++) txn.free([loc.s + i]);
+        }
+        this._cat = emptyCatalog();
+
+        // 目录字节按释放页并入后的形态序列化;目录页从旧 free 链分配
+        const catBytes = te.encode(JSON.stringify({ free: txn.previewFree(), cols: {} }));
+        const need = pagesNeeded(catBytes.length, this._chunk);
+        const pages = txn.alloc(need);
+        txn.commitFreed();
+        for (let i = 0; i < need; i++) {
+          txn.setDirty(pages[i], catBytes.subarray(i * this._chunk, (i + 1) * this._chunk));
+        }
+        let pageCount = txn.extendedTo;
+        for (const p of txn.dirty.keys()) pageCount = Math.max(pageCount, p + 1);
+        await this._commitLayout(txn, {
+          catalogStart: pages[0],
+          catalogPages: need,
+          catalogByteLen: catBytes.length,
+          pageCount,
+        });
+        this._chain = [{ s: pages[0], p: need, l: catBytes.length }];
+        this._pageCache.clear();
+        this._mat.clear();
+        this.#closed = true;
+        return true;
+      } catch (e) {
+        txn.rollback();
+        throw e;
       }
-      await this._commitLayout(txn, {
-        catalogStart: FIRST_DATA_PAGE,
-        catalogPages: need,
-        catalogByteLen: catBytes.length,
-        pageCount: cursor,
-      });
-      this._pageCache.clear();
-      this._mat.clear();
-      this.#closed = true;
-      return true;
     });
   }
 
@@ -922,47 +1111,114 @@ export class Database {
     return out;
   }
 
-  async _loadCatalog(sb) {
+  /** 读一段目录链记录(快照或 delta),返回 UTF-8 文本 */
+  async #readRecord({ s, p, l }) {
     const parts = [];
-    let remain = sb.catalogByteLen;
-    for (let i = 0; i < sb.catalogPages && remain > 0; i++) {
-      const raw = await this.#backend.readPage(sb.catalogStart + i);
-      let logical;
-      if (sb.encrypted) logical = await decryptPage(raw, this.#key, CHUNK_ENC);
-      else logical = raw;
+    let remain = l;
+    for (let i = 0; i < p && remain > 0; i++) {
+      const raw = await this.#backend.readPage(s + i);
+      const logical = this.#password != null
+        ? await decryptPage(raw, this.#key, CHUNK_ENC)
+        : raw;
       const take = Math.min(remain, logical.length);
       parts.push(logical.subarray(0, take));
       remain -= take;
     }
     let total = 0;
-    for (const p of parts) total += p.length;
+    for (const part of parts) total += part.length;
     const buf = new Uint8Array(total);
     let o = 0;
-    for (const p of parts) {
-      buf.set(p, o);
-      o += p.length;
+    for (const part of parts) {
+      buf.set(part, o);
+      o += part.length;
     }
     return td.decode(buf);
   }
 
+  /** 本句柄的基准代是否仍是盘上权威代(多句柄同文件时,过期句柄退 checkpoint) */
+  async #stillAuthoritative() {
+    if (!this._super) return false;
+    try {
+      const cur = pickSuper(
+        await this.#backend.readPage(SUPER_A),
+        await this.#backend.readPage(SUPER_B),
+      );
+      return !!cur && cur.generation === this._super.generation;
+    } catch {
+      return false;
+    }
+  }
+
   /* ---- 提交 ---- */
 
+  /**
+   * 提交一笔写事务。小改动走 delta 链:只落盘本笔的目录差异(通常 1 页),
+   * 超级块翻槽指向新链头 —— 原子性与全量提交完全一致。以下情形退回
+   * checkpoint(全量目录 + 回收旧链页):
+   *   · 链长已达 DELTA_CHAIN_MAX;
+   *   · 本笔差异超过 DELTA_MAX_PAGES;
+   *   · 基准代已过期(别的句柄写过同文件)或回放自检不过。
+   * 分配一律使用旧 free 链(本事务释放的页旧代仍引用,不可复用);
+   * 释放页在 alloc 全部完成后才并入将要落盘的目录。
+   */
   async _commit(txn) {
-    const catBytes = te.encode(JSON.stringify(this._cat));
-    const need = pagesNeeded(catBytes.length, this._chunk);
-    const pages = txn.alloc(need);
-    for (let i = 0; i < need; i++) {
-      const start = i * this._chunk;
-      txn.setDirty(pages[i], catBytes.subarray(start, start + this._chunk));
+    // 预演目录:释放页并入后的形态(diff / 序列化都以它为准)
+    const freeFinal = txn.previewFree();
+    const target = txn.freed.length ? { ...this._cat, free: freeFinal } : this._cat;
+
+    let delta = null;
+    if (this._chain.length && (await this.#stillAuthoritative())) {
+      const base = JSON.parse(txn.catalogJson);
+      const diff = diffCatalog(base, target);
+      // 回放自检:基准 + 差异必须精确还原目标目录,否则退全量
+      if (deepEq(applyDelta(clone(base), diff), target)) delta = diff;
     }
-    let pageCount = txn.extendedTo;
-    for (const p of txn.dirty.keys()) pageCount = Math.max(pageCount, p + 1);
-    await this._commitLayout(txn, {
+
+    let pageCount = 0;
+    const place = (bytes) => {
+      const need = pagesNeeded(bytes.length, this._chunk);
+      const pages = txn.alloc(need);   // 旧 free 链:不含本事务释放的页
+      for (let i = 0; i < need; i++) {
+        const start = i * this._chunk;
+        txn.setDirty(pages[i], bytes.subarray(start, start + this._chunk));
+      }
+      return pages;
+    };
+    const span = (pages, len) => ({
       catalogStart: pages[0],
-      catalogPages: need,
-      catalogByteLen: catBytes.length,
-      pageCount,
+      catalogPages: pages.length,
+      catalogByteLen: len,
     });
+
+    const deltas = this._chain.length - 1; // [0] 是基准快照
+    if (delta != null && deltas < DELTA_CHAIN_MAX) {
+      const rec = { d: 1, prev: this._chain[this._chain.length - 1], ...delta };
+      const bytes = te.encode(JSON.stringify(rec));
+      if (pagesNeeded(bytes.length, this._chunk) <= DELTA_MAX_PAGES) {
+        const pages = place(bytes);
+        txn.commitFreed();               // 释放页此刻才进内存目录(此后不再 alloc)
+        pageCount = txn.extendedTo;
+        for (const p of txn.dirty.keys()) pageCount = Math.max(pageCount, p + 1);
+        await this._commitLayout(txn, { ...span(pages, bytes.length), pageCount });
+        this._chain.push({ s: pages[0], p: pages.length, l: bytes.length });
+        this._pageCache.clear();
+        return;
+      }
+    }
+
+    // checkpoint:旧链页(基准快照 + 全部 delta)回收,全量目录落盘
+    for (const loc of this._chain) {
+      for (let i = 0; i < loc.p; i++) txn.free([loc.s + i]);
+    }
+    const catBytes = te.encode(JSON.stringify(
+      this._chain.length ? { ...target, free: txn.previewFree() } : target,
+    ));
+    const pages = place(catBytes);
+    txn.commitFreed();
+    pageCount = txn.extendedTo;
+    for (const p of txn.dirty.keys()) pageCount = Math.max(pageCount, p + 1);
+    await this._commitLayout(txn, { ...span(pages, catBytes.length), pageCount });
+    this._chain = [{ s: pages[0], p: pages.length, l: catBytes.length }];
     this._pageCache.clear();
   }
 
@@ -1054,6 +1310,7 @@ export class Database {
         catalogByteLen: catBytes.length,
         pageCount: cursor,
       });
+      db._chain = [{ s: FIRST_DATA_PAGE, p: need, l: catBytes.length }];
       db._pageCache.clear();
       return db;
     }
@@ -1076,10 +1333,47 @@ export class Database {
       pageCount: sb.pageCount,
       lastSlot,
     });
-    const json = await db._loadCatalog(sb);
-    db._cat = JSON.parse(json);
+
+    // 目录链:超级块指向链头(基准快照或 delta)。沿 prev 回溯到快照,
+    // 再由旧到新重放 delta 还原目录。形状非法 / 循环 → 目录链损坏。
+    const links = [];
+    const deltasRev = [];
+    const seen = new Set();
+    let loc = { s: sb.catalogStart, p: sb.catalogPages, l: sb.catalogByteLen };
+    let rec;
+    for (;;) {
+      const key2 = `${loc?.s}:${loc?.p}`;
+      if (!loc || typeof loc !== 'object'
+        || !Number.isInteger(loc.s) || loc.s < FIRST_DATA_PAGE
+        || !Number.isInteger(loc.p) || loc.p < 1
+        || !Number.isInteger(loc.l) || loc.l < 1 || loc.l > loc.p * chunk
+        || seen.has(key2) || links.length > 4096) {
+        throw new Error(`目录链损坏: ${name}`);
+      }
+      seen.add(key2);
+      let json;
+      try {
+        json = await db.#readRecord(loc);
+        rec = JSON.parse(json);
+      } catch (e) {
+        throw new Error(`目录链损坏: ${name}(${e.message})`);
+      }
+      links.push({ ...loc });
+      if (rec && rec.d === 1) {
+        deltasRev.push(rec);
+        loc = rec.prev;
+        continue;
+      }
+      break; // 基准快照(或旧版整目录)
+    }
+    if (!rec || typeof rec !== 'object' || typeof rec.cols !== 'object' || rec.cols == null) {
+      throw new Error(`目录损坏: ${name}`);
+    }
+    for (let i = deltasRev.length - 1; i >= 0; i--) applyDelta(rec, deltasRev[i]);
+    db._cat = rec;
     if (!db._cat.cols) db._cat.cols = {};
     if (!Array.isArray(db._cat.free)) db._cat.free = [];
+    db._chain = links.reverse(); // [基准快照, delta1, …, deltaN]
     return db;
   }
 }

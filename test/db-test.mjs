@@ -14,6 +14,7 @@ import {
   PAGE_SIZE,
   decodeSuper,
 } from '../src/index.js';
+import { encodeSuper } from '../src/page.js';
 import { createMockWebosFs } from './mock-webos-fs.mjs';
 
 let pass = 0;
@@ -206,6 +207,185 @@ section('单条指令原子性', async () => {
   const live = a && b ? (a.generation >= b.generation ? a : b) : a || b;
   t('失败后仍有合法超级块', !!live);
   eq(await c.count() >= 2, true, '回滚后读正常');
+});
+
+/* ---------- delta 链提交 ---------- */
+
+/** 同文件换新后端重开(走链回放恢复路径);随机名避开单例注册表 */
+async function reopen(fs, path, opts = {}) {
+  const name = `rw-${Math.random().toString(36).slice(2, 8)}`;
+  const storage = createFileBackend(fs, path);
+  const db = await open(name, { storage, ...opts });
+  return { db, storage };
+}
+
+section('delta 链:混操作重放', async () => {
+  const { fs, path } = fileDb('delta1');
+  const { db, storage } = await reopen(fs, path);
+  const col = db.collection('items');
+  await db.createCollection('strict1', { schema: { n: 'number' } });
+  await db.createCollection('auto1', { mode: 'auto' });
+
+  await col.insert({ id: 'a', v: 1 });
+  await col.insert({ id: 'b', v: 2 });
+  await col.update('a', { v: 11 });
+  await col.remove('b');
+  await col.insert({ id: 'c', v: 3 });
+  await db.collection('strict1').insert({ n: 1 });
+  await db.collection('auto1').insert({ a: 1 });          // 吸收 a
+  await db.collection('auto1').insert({ b: 'x' });        // 吸收 b
+  await db.collection('strict1').setSchema({ n: { type: 'number', required: true }, s: 'string' });
+  await db.createCollection('tmp1');
+  await db.dropCollection('tmp1');
+
+  db.close();
+  const { db: db2 } = await reopen(fs, path);
+  const items = db2.collection('items');
+  eq(await items.count(), 2, '重放后文档数');
+  eq((await items.get('a')).v, 11, '重放后新值');
+  eq(await items.get('b'), null, '删除不复活');
+  deepEq(await db2.listCollections(), ['auto1', 'items', 'strict1'], '集合增删重放');
+  eq(await db2.collection('strict1').count(), 1, 'strict 文档在');
+  // schema 也须随 delta 重放:strict 校验 + auto 吸收结果
+  await assert.rejects(() => db2.collection('strict1').insert({ n: 'x' }), /schema/, '重放后 strict 仍校验');
+  await assert.rejects(() => db2.collection('strict1').insert({ s: 'y' }), /schema/, '重放后新 schema 生效(缺 required 的 n 报错)');
+  await db2.collection('auto1').insert({ c: 2 });          // 不应因 a/b 缺失报错
+  eq(await db2.collection('auto1').count(), 3, '重放后 auto 吸收的字段仍是可选');
+});
+
+section('delta 链:checkpoint 边界与大操作回退', async () => {
+  const { fs, path } = fileDb('delta2');
+  const { db, storage } = await reopen(fs, path);
+  const c = db.collection('seq');
+
+  // 40 笔提交:超过链上限 32,中途必然发生 checkpoint
+  for (let i = 0; i < 40; i++) await c.insert({ i });
+  const pc1 = await storage.pageCount();
+  db.close();
+  const r2 = await reopen(fs, path);
+  eq(await r2.db.collection('seq').count(), 40, 'checkpoint 后重放完整');
+  eq(await r2.db.collection('seq').findOne({ i: 39 }) != null, true, '末笔在');
+  r2.db.close();
+
+  // 单笔大操作:3000 文档的 delta 必超 16 页 → 全量 checkpoint 路径
+  const r3 = await reopen(fs, path);
+  const big = [];
+  for (let i = 0; i < 3000; i++) big.push({ id: `k${i}`, v: i });
+  await r3.db.collection('big').insertMany(big);
+  r3.db.close();
+  const r4 = await reopen(fs, path);
+  eq(await r4.db.collection('big').count(), 3000, '大操作(checkpoint)后重放完整');
+  eq((await r4.db.collection('big').get('k2999')).v, 2999, '大操作末条在');
+  void pc1;
+});
+
+section('delta 链:泄漏回归(旧目录页回收)', async () => {
+  const { fs, path } = fileDb('delta3');
+  const { db, storage } = await reopen(fs, path);
+  const c = db.collection('t');
+  await c.insert({ id: 'x', v: 0, pad: 'p'.repeat(50) });
+
+  const base = await storage.pageCount();
+  for (let i = 0; i < 60; i++) await c.update('x', { v: i, pad: 'p'.repeat(50) });
+  const g1 = (await storage.pageCount()) - base;
+  for (let i = 0; i < 60; i++) await c.update('x', { v: 1000 + i, pad: 'p'.repeat(50) });
+  const g2 = (await storage.pageCount()) - base - g1;
+  t(`60 次更新仅增 ${g1} 页(旧实现 +120)`, g1 <= 40, `g1=${g1}`);
+  t(`再 60 次仅增 ${g2} 页(有界不线性)`, g2 <= 8, `g2=${g2}`);
+  db.close();
+  const r = await reopen(fs, path);
+  eq((await r.db.collection('t').get('x')).v, 1059, '回收复用后数据完好');
+});
+
+section('delta 链:翻槽前断写(旧代不可被撕毁)', async () => {
+  const { fs, path } = fileDb('delta4');
+  const { db, storage } = await reopen(fs, path);
+  const c = db.collection('t');
+  await c.insert({ id: 'a', v: 'old-value-123456' });
+  await c.update('a', { v: 'mid-value-1234567' });
+
+  // 超级块写入失败 = 数据页/delta 页已落盘但未翻槽(等效断电在翻槽前)
+  const orig = storage.writePages.bind(storage);
+  storage.writePages = async (startNo, chunks) => {
+    if (startNo === 0 || startNo === 1) throw new Error('simulated crash before flip');
+    return orig(startNo, chunks);
+  };
+  await assert.rejects(() => c.update('a', { v: 'new-value-123456' }), /simulated crash/);
+  storage.writePages = orig;
+
+  db.close();
+  const r = await reopen(fs, path);
+  eq((await r.db.collection('t').get('a')).v, 'mid-value-1234567', '断写的更新不可见,旧值完好');
+});
+
+section('delta 链:损坏链头 → 打开报错', async () => {
+  const { fs, path } = fileDb('delta5');
+  const { db, storage } = await reopen(fs, path);
+  const c = db.collection('t');
+  await c.insert({ id: 'a', n: 1 });
+  await c.insert({ id: 'b', n: 2 });
+  db.close();
+
+  // 找到链头页(超级块 catalogStart),用垃圾覆写
+  const { a, b } = await supers(storage);
+  const live = a && b ? (a.generation >= b.generation ? a : b) : a || b;
+  await fs.writeAt(path, live.catalogStart * PAGE_SIZE, new Uint8Array(PAGE_SIZE).fill(0x5a));
+  await assert.rejects(() => reopen(fs, path), /损坏/, '链头损坏必须报错而非静默空库');
+});
+
+section('delta 链:加密库的 delta 与重开', async () => {
+  const { fs, path } = fileDb('delta6');
+  const { db } = await reopen(fs, path, { password: 'pw-delta' });
+  const c = db.collection('sec');
+  for (let i = 0; i < 5; i++) await c.insert({ id: `s${i}`, secret: `机密delta-${i}` });
+  db.close();
+
+  const bytes = fs.readBinary(path);
+  const asText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  t('delta 页同受页级加密', !asText.includes('机密delta') && !asText.includes('sec'));
+
+  const r = await reopen(fs, path, { password: 'pw-delta' });
+  eq((await r.db.collection('sec').get('s4')).secret, '机密delta-4', '加密 delta 重放');
+  r.db.close();
+  await assert.rejects(() => reopen(fs, path, { password: 'wrong' }), /密码错误|损坏/, '错密码拒绝');
+});
+
+section('delta 链:旧版整目录文件兼容', async () => {
+  // 手工构造 delta 链出现之前的 v1 文件:超级块直指整目录快照(无 prev)
+  const { fs, path } = fileDb('legacy');
+  const docBytes = new TextEncoder().encode(JSON.stringify({ id: 'old1', v: 42 }));
+  const cat = { free: [], cols: { legacy: { seq: 1, docs: { old1: { p: [3], n: docBytes.length } } } } };
+  const catBytes = new TextEncoder().encode(JSON.stringify(cat));
+  const catPage = new Uint8Array(PAGE_SIZE);
+  catPage.set(catBytes);
+  const docPage = new Uint8Array(PAGE_SIZE);
+  docPage.set(docBytes);
+  const salt = new Uint8Array(16);
+  const sb = encodeSuper({
+    version: 1,
+    pageSize: PAGE_SIZE,
+    chunkSize: PAGE_SIZE,
+    generation: 7,
+    encrypted: 0,
+    salt,
+    catalogStart: 2,
+    catalogPages: 1,
+    catalogByteLen: catBytes.length,
+    pageCount: 4,
+  });
+  await fs.writeAt(path, 0, sb);
+  await fs.writeAt(path, 2 * PAGE_SIZE, catPage);
+  await fs.writeAt(path, 3 * PAGE_SIZE, docPage);
+
+  const { db } = await reopen(fs, path);
+  const got = await db.collection('legacy').get('old1');
+  eq(got?.v, 42, 'v1 整目录文件照常打开');
+  // 旧文件上的第一笔提交自然转成 delta 链
+  await db.collection('legacy').insert({ id: 'new1', v: 7 });
+  db.close();
+  const r = await reopen(fs, path);
+  eq(await r.db.collection('legacy').count(), 2, '转链后重放完整');
+  eq((await r.db.collection('legacy').get('old1')).v, 42, '旧数据不丢');
 });
 
 /* ---------- 页级加密 ---------- */
