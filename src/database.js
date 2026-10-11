@@ -815,9 +815,12 @@ export class Database {
    * SQL 查询(只读 SELECT;数据经集合物化,首次查询触发 loadAll)。
    * @param {string} text SQL 文本(? 为占位参数)
    * @param {Array} [params] 参数按序绑定
+   * @param {{collation?: string}} [opts] collation:ORDER BY 文本键的
+   *        Intl.Collator locale(如 'zh' 拼音 / 'zh-u-co-stroke' 笔画 /
+   *        'en'),空串=码点序;缺省 'zh'
    */
-  sql(text, params = []) {
-    return runSql(this, text, params);
+  sql(text, params = [], opts) {
+    return runSql(this, text, params, opts);
   }
 
   listCollections() {

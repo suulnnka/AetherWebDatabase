@@ -10,9 +10,12 @@
  *     [WHERE …] [GROUP BY …] [HAVING …]
  *     [ORDER BY … [ASC|DESC], …] [LIMIT n [OFFSET m]]
  *   表达式:比较 / AND / OR / NOT / IN(列表|子查询)/ BETWEEN /
- *     LIKE / IS [NOT] NULL / + - * / % / ||(拼接)/ ? 参数
+ *     LIKE / IS [NOT] NULL / MATCH(空白分词全命中,免索引扫描)/
+ *     CASE [值] WHEN … THEN … [ELSE …] END(简单式/搜索式)/
+ *     + - * / % / ||(拼接)/ ? 参数
  *   聚合:COUNT(*|x|DISTINCT x) / SUM / AVG / MIN / MAX + GROUP BY + HAVING
- *   标量函数:LOWER UPPER LENGTH ABS ROUND COALESCE
+ *   标量函数:LOWER UPPER LENGTH ABS ROUND COALESCE INSTR
+ *   ORDER BY 文本键按拼音序(Intl.Collator 'zh');等值/join/分组仍精确值
  *   子查询:
  *     · FROM 派生表(非相关)
  *     · 非相关 IN / EXISTS / 标量子查询(执行一次缓存)
@@ -39,7 +42,7 @@ const KEYWORDS = new Set([
   'SELECT', 'DISTINCT', 'FROM', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER',
   'LIMIT', 'OFFSET', 'AS', 'JOIN', 'INNER', 'LEFT', 'OUTER', 'ON',
   'AND', 'OR', 'NOT', 'IN', 'BETWEEN', 'LIKE', 'IS', 'NULL', 'TRUE',
-  'FALSE', 'ASC', 'DESC', 'EXISTS',
+  'FALSE', 'ASC', 'DESC', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'MATCH',
 ]);
 
 function tokenize(src) {
@@ -254,7 +257,7 @@ class Parser {
       return { t: 'isnull', e, not };
     }
     let not = false;
-    if (this.isKw('NOT') && (this.isKw('IN', 1) || this.isKw('BETWEEN', 1) || this.isKw('LIKE', 1))) {
+    if (this.isKw('NOT') && (this.isKw('IN', 1) || this.isKw('BETWEEN', 1) || this.isKw('LIKE', 1) || this.isKw('MATCH', 1))) {
       this.next();
       not = true;
     }
@@ -279,6 +282,11 @@ class Parser {
     if (this.eatKw('LIKE')) {
       const pat = this.parseAdditive();
       return { t: 'like', e, pat, not };
+    }
+    /* 全文匹配(免索引逐行扫):查询串按空白分词,全部词都出现才命中 */
+    if (this.eatKw('MATCH')) {
+      const pat = this.parseAdditive();
+      return { t: 'match', e, pat, not };
     }
     const t = this.peek();
     if (t.k === 'op' && ['=', '!=', '<', '<=', '>', '>='].includes(t.v)) {
@@ -327,6 +335,22 @@ class Parser {
       const q = this.parseQuery();
       this.expectOp(')');
       return { t: 'exists', q };
+    }
+    /* CASE [operand] WHEN … THEN … [WHEN …] [ELSE …] END:有无 operand 区分简单式/搜索式 */
+    if (t.k === 'kw' && t.v === 'CASE') {
+      this.i++;
+      const operand = this.isKw('WHEN') ? null : this.parseExpr();
+      const whens = [];
+      while (this.eatKw('WHEN')) {
+        const w = this.parseExpr();
+        this.expectKw('THEN');
+        whens.push({ w, r: this.parseExpr() });
+      }
+      if (!whens.length) this.fail('CASE 需要至少一个 WHEN');
+      let els = null;
+      if (this.eatKw('ELSE')) els = this.parseExpr();
+      this.expectKw('END');
+      return { t: 'case', operand, whens, els };
     }
     if (t.k === 'op' && t.v === '(') {
       this.i++;
@@ -425,6 +449,19 @@ function likeToRe(pat) {
   return new RegExp(`^${re}$`);
 }
 
+/* 排序键的文本比较:按查询指定的 collation(Intl.Collator locale,
+ * 缺省 'zh' 拼音;空串=码点序)。仅用于 ORDER BY —— 等值/join/分组/
+ * IN 仍按精确值,不受音序影响 */
+const collCache = new Map();
+function collOf(locale) {
+  if (!locale) return null;
+  if (!collCache.has(locale)) {
+    try { collCache.set(locale, new Intl.Collator(locale)); }
+    catch { collCache.set(locale, null); }   // 非法 locale 回落码点序
+  }
+  return collCache.get(locale);
+}
+
 /** 值 → 规范键(join 桶 / 分组 / IN 集合) */
 function normKey(v) {
   if (v == null) return '\u0000';
@@ -491,9 +528,11 @@ const AGG_FUNCS = new Set(['COUNT', 'SUM', 'AVG', 'MIN', 'MAX']);
 /* ---------- Runtime:物化 + 编译 + 执行 ---------- */
 
 class Runtime {
-  constructor(db, params) {
+  constructor(db, params, opts = {}) {
     this.db = db;
     this.params = params;
+    /** ORDER BY 文本键的排序 locale(undefined → 'zh' 拼音;'' → 码点序) */
+    this.collation = opts.collation === undefined ? 'zh' : opts.collation;
     /** 集合名 → 物化行数组 */
     this.tables = new Map();
     /** 派生表 Query 节点 → 输出行数组 */
@@ -536,6 +575,12 @@ class Runtime {
         case 'in': await walk(e.e); for (const x of e.list ?? []) await walk(x); if (e.sub) await this.resolve(e.sub); break;
         case 'between': await walk(e.e); await walk(e.lo); await walk(e.hi); break;
         case 'like': await walk(e.e); await walk(e.pat); break;
+        case 'match': await walk(e.e); await walk(e.pat); break;
+        case 'case':
+          if (e.operand != null) await walk(e.operand);
+          for (const w of e.whens) { await walk(w.w); await walk(w.r); }
+          if (e.els != null) await walk(e.els);
+          break;
         case 'func': for (const a of e.args) await walk(a); break;
         case 'sub': case 'exists': await this.resolve(e.q); break;
         default: break;  // col / lit / param
@@ -624,6 +669,50 @@ class Runtime {
           return likeToRe(p).test(String(v));
         };
         return { fn: e.not ? (r, g, o, or) => not3(base(r, g, o, or)) : base, refs: uni(C, P), hasAgg: C.hasAgg || P.hasAgg, wild: C.wild || P.wild };
+      }
+      case 'match': {
+        const C = this.compileExpr(e.e, scope, opts);
+        const P = this.compileExpr(e.pat, scope, opts);
+        const base = (r, g, o, or) => {
+          const v = C.fn(r, g, o, or);
+          const p = P.fn(r, g, o, or);
+          if (v == null || p == null || typeof p !== 'string') return null;
+          const terms = p.toLowerCase().split(/\s+/).filter(Boolean);
+          if (!terms.length) return null;   // 空查询不命中
+          const text = String(v).toLowerCase();
+          for (const term of terms) {
+            if (!text.includes(term)) return false;
+          }
+          return true;
+        };
+        return { fn: e.not ? (r, g, o, or) => not3(base(r, g, o, or)) : base, refs: uni(C, P), hasAgg: C.hasAgg || P.hasAgg, wild: C.wild || P.wild };
+      }
+      case 'case': {
+        /* 简单式:operand 逐个与 WHEN 值按 '=' 比较(null 不等);
+         * 搜索式:WHEN 条件须 === true;无 ELSE 得 null */
+        const opC = e.operand != null ? this.compileExpr(e.operand, scope, opts) : null;
+        const ws = e.whens.map(({ w, r }) => ({ w: this.compileExpr(w, scope, opts), r: this.compileExpr(r, scope, opts) }));
+        const els = e.els != null ? this.compileExpr(e.els, scope, opts) : null;
+        const fn = (r, g, o, or) => {
+          if (opC) {
+            const v = opC.fn(r, g, o, or);
+            for (const p of ws) {
+              if (cmpOp('=', v, p.w.fn(r, g, o, or)) === true) return p.r.fn(r, g, o, or);
+            }
+          } else {
+            for (const p of ws) {
+              if (p.w.fn(r, g, o, or) === true) return p.r.fn(r, g, o, or);
+            }
+          }
+          return els ? els.fn(r, g, o, or) : null;
+        };
+        const all = [...(opC ? [opC] : []), ...ws.flatMap((p) => [p.w, p.r]), ...(els ? [els] : [])];
+        return {
+          fn,
+          refs: uni(...all),
+          hasAgg: all.some((c) => c.hasAgg),
+          wild: all.some((c) => c.wild),
+        };
       }
       case 'in': return this.compileIn(e, scope, opts);
       case 'func': return this.compileFunc(e, scope, opts);
@@ -836,8 +925,16 @@ class Runtime {
         const m = 10 ** p;
         return Math.round(v * m) / m;
       };
+    } else if (name === 'INSTR') {
+      /* 首次出现位置(1 起),未命中 0,任一为 null 得 null —— SQLite 同款 */
+      fn = (r, g, o, or) => {
+        const [v, p] = F(r, g, o, or);
+        if (v == null || p == null) return null;
+        const idx = String(v).indexOf(String(p));
+        return idx < 0 ? 0 : idx + 1;
+      };
     } else {
-      throw new Error(`未知函数: ${name}(可用:COUNT SUM AVG MIN MAX LOWER UPPER LENGTH ABS ROUND COALESCE)`);
+      throw new Error(`未知函数: ${name}(可用:COUNT SUM AVG MIN MAX LOWER UPPER LENGTH ABS ROUND COALESCE INSTR)`);
     }
     return { fn, refs: uni(...args), hasAgg: args.some((c) => c.hasAgg), wild: args.some((c) => c.wild) };
   }
@@ -904,6 +1001,12 @@ class Runtime {
           break;
         case 'between': collect(e.e, acc); collect(e.lo, acc); collect(e.hi, acc); break;
         case 'like': collect(e.e, acc); collect(e.pat, acc); break;
+        case 'match': collect(e.e, acc); collect(e.pat, acc); break;
+        case 'case':
+          if (e.operand != null) collect(e.operand, acc);
+          for (const w of e.whens) { collect(w.w, acc); collect(w.r, acc); }
+          if (e.els != null) collect(e.els, acc);
+          break;
         case 'func': for (const a of e.args) collect(a, acc); break;
         default: break;  // sub/exists 嵌套按黑盒处理(其内部作用域独立)
       }
@@ -1229,7 +1332,8 @@ class Runtime {
       }
       return { out, row, group };
     };
-    /* 排序比较:null 恒排最后,不随 DESC 翻转 */
+    /* 排序比较:null 恒排最后,不随 DESC 翻转;文本键按 collation(默认拼音) */
+    const oc = collOf(this.collation);
     const cmpKeyed = (a, b) => {
       for (let idx = 0; idx < orderCs.length; idx++) {
         const va = a.ks[idx];
@@ -1239,7 +1343,7 @@ class Runtime {
           if (vb != null) return 1;
           continue;
         }
-        const c = cmpVal(va, vb);
+        const c = oc && typeof va === 'string' && typeof vb === 'string' ? oc.compare(va, vb) : cmpVal(va, vb);
         if (c) return orderCs[idx].desc ? -c : c;
       }
       return 0;
@@ -1344,6 +1448,13 @@ function rewriteAliasRefs(e, items) {
     case 'in': return { ...e, e: rewriteAliasRefs(e.e, items), list: (e.list ?? []).map((x) => rewriteAliasRefs(x, items)) };
     case 'between': return { ...e, e: rewriteAliasRefs(e.e, items), lo: rewriteAliasRefs(e.lo, items), hi: rewriteAliasRefs(e.hi, items) };
     case 'like': return { ...e, e: rewriteAliasRefs(e.e, items), pat: rewriteAliasRefs(e.pat, items) };
+    case 'match': return { ...e, e: rewriteAliasRefs(e.e, items), pat: rewriteAliasRefs(e.pat, items) };
+    case 'case': return {
+      ...e,
+      operand: rewriteAliasRefs(e.operand, items),
+      whens: e.whens.map((w) => ({ w: rewriteAliasRefs(w.w, items), r: rewriteAliasRefs(w.r, items) })),
+      els: rewriteAliasRefs(e.els, items),
+    };
     case 'func': return { ...e, args: e.args.map((a) => rewriteAliasRefs(a, items)) };
     default: return e;  // lit / param / sub / exists
   }
@@ -1365,7 +1476,7 @@ function uni(...cs) {
  * @param {string} text
  * @param {Array} params
  */
-export async function runSql(db, text, params) {
+export async function runSql(db, text, params, opts) {
   if (typeof text !== 'string' || !text.trim()) throw new Error('SQL 不能为空');
   if (params != null && !Array.isArray(params)) throw new Error('SQL 参数必须是数组');
   const ast = parse(text);
@@ -1373,7 +1484,7 @@ export async function runSql(db, text, params) {
   if (ast.__paramCount > ps.length) {
     throw new Error(`SQL 需要 ${ast.__paramCount} 个参数,只提供 ${ps.length} 个`);
   }
-  const rt = new Runtime(db, ps);
+  const rt = new Runtime(db, ps, opts);
   await rt.resolve(ast);
   return rt.exec(ast);
 }

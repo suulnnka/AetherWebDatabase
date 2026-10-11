@@ -268,6 +268,121 @@ section('LIMIT 短路 / top-N / 单键原值', async () => {
   );
 });
 
+/* ---------- 中文拼音序 / MATCH / INSTR / CASE ---------- */
+section('拼音排序 / MATCH 全文 / INSTR / CASE', async () => {
+  const db = await newDb('zh');
+  await db.collection('p').insertMany([
+    { id: 'z', name: '张三' }, { id: 'l', name: '李四' },
+    { id: 'w', name: '王五' }, { id: 'c', name: '陈六' },
+  ]);
+  /* 码点序是 张<李<王<陈,拼音序应是 陈(chén)<李(lǐ)<王(wáng)<张(zhāng) */
+  deepEq(
+    (await db.sql('SELECT id FROM p ORDER BY name')).map((r) => r.id),
+    ['c', 'l', 'w', 'z'],
+    'ORDER BY 中文按拼音序',
+  );
+  deepEq(
+    (await db.sql('SELECT id FROM p ORDER BY name DESC')).map((r) => r.id),
+    ['z', 'w', 'l', 'c'],
+    '拼音序 DESC',
+  );
+  deepEq(
+    (await db.sql('SELECT COUNT(*) AS n FROM p WHERE name = ?', ['李四']))[0].n,
+    1,
+    '等值过滤仍按精确值(不受拼音影响)',
+  );
+
+  /* collation 选项:码点序 / 其他 locale;等值语义不变 */
+  deepEq(
+    (await db.sql('SELECT id FROM p ORDER BY name', [], { collation: '' })).map((r) => r.id),
+    ['z', 'l', 'w', 'c'],
+    'collation 空串 = 码点序(张李王陈)',
+  );
+  deepEq(
+    (await db.sql('SELECT id FROM p ORDER BY name', [], { collation: 'en' })).map((r) => r.id),
+    ['z', 'l', 'w', 'c'],
+    "collation 'en' 不识拼音:中文按 en 默认权重(≈码点序),证明设置生效",
+  );
+  deepEq(
+    (await db.sql('SELECT id FROM p ORDER BY name')).map((r) => r.id),
+    ['c', 'l', 'w', 'z'],
+    '缺省 collation 仍为 zh 拼音',
+  );
+
+  /* MATCH:空白分词全命中(AND)、大小写不敏感、免索引 */
+  await db.collection('docs').insertMany([
+    { id: 'd1', title: '浏览器历史与收藏', body: 'FireFox 式最近访问记录' },
+    { id: 'd2', title: '邮件应用', body: '最近访问过的发件人' },
+    { id: 'd3', title: 'null 正文', body: null },
+  ]);
+  deepEq(
+    (await db.sql("SELECT id FROM docs WHERE body MATCH '最近 记录' ORDER BY id")).map((r) => r.id),
+    ['d1'],
+    'MATCH 多词全命中',
+  );
+  deepEq(
+    (await db.sql("SELECT id FROM docs WHERE body MATCH 'firefox'")).map((r) => r.id),
+    ['d1'],
+    'MATCH 大小写不敏感',
+  );
+  deepEq(
+    (await db.sql("SELECT id FROM docs WHERE title MATCH '应用'")).map((r) => r.id),
+    ['d2'],
+    'MATCH 中文词',
+  );
+  deepEq(
+    (await db.sql("SELECT id FROM docs WHERE NOT (body MATCH '最近') ORDER BY id")).map((r) => r.id),
+    [],
+    'NOT MATCH(null 正文与双命中均不入选)',
+  );
+  deepEq(
+    (await db.sql("SELECT id FROM docs WHERE body MATCH ''")).length,
+    0,
+    '空查询串不命中',
+  );
+  deepEq(
+    await db.sql("SELECT INSTR(body, '访问') AS p, INSTR(body, '不存在') AS q, INSTR(body, null) AS n FROM docs WHERE id = 'd1'"),
+    [{ p: 12, q: 0, n: null }],
+    'INSTR 首现位置/未命中 0/null',
+  );
+
+  /* CASE:搜索式 / 简单式 / ELSE / 无 ELSE 得 null / 嵌套 */
+  await db.collection('sc').insertMany([
+    { id: 's1', score: 95 }, { id: 's2', score: 72 }, { id: 's3', score: 40 }, { id: 's4', score: null },
+  ]);
+  deepEq(
+    await db.sql("SELECT id, CASE WHEN score >= 90 THEN '优' WHEN score >= 60 THEN '良' ELSE '差' END AS grade FROM sc ORDER BY id"),
+    [{ id: 's1', grade: '优' }, { id: 's2', grade: '良' }, { id: 's3', grade: '差' }, { id: 's4', grade: '差' }],
+    'CASE 搜索式(null 走 ELSE)',
+  );
+  deepEq(
+    await db.sql("SELECT CASE score WHEN 95 THEN 'A' WHEN 72 THEN 'B' END AS g FROM sc ORDER BY id"),
+    [{ g: 'A' }, { g: 'B' }, { g: null }, { g: null }],
+    'CASE 简单式(无 ELSE 得 null,null 不等任何值)',
+  );
+  deepEq(
+    (await db.sql("SELECT id FROM sc WHERE CASE WHEN score >= 60 THEN 1 ELSE 0 END = 1 ORDER BY id")).map((r) => r.id),
+    ['s1', 's2'],
+    'CASE 在 WHERE 中(单源可下推)',
+  );
+  deepEq(
+    await db.sql("SELECT id, CASE WHEN score >= 90 THEN '高' ELSE CASE WHEN score >= 60 THEN '中' ELSE '低' END END AS tier FROM sc ORDER BY id"),
+    [{ id: 's1', tier: '高' }, { id: 's2', tier: '中' }, { id: 's3', tier: '低' }, { id: 's4', tier: '低' }],
+    'CASE 嵌套',
+  );
+  deepEq(
+    (await db.sql("SELECT COUNT(*) AS n FROM sc GROUP BY CASE WHEN score >= 60 THEN '及格' ELSE '不及格' END ORDER BY n DESC")).map((r) => r.n),
+    [2, 2],
+    'CASE 在 GROUP BY(null 归 ELSE 分组)',
+  );
+  try {
+    await db.sql('SELECT CASE FROM sc');
+    t('CASE 缺 WHEN 报解析错误', false, '未报错');
+  } catch (e) {
+    t('CASE 缺 WHEN 报解析错误', /WHEN|解析/.test(e.message), `消息: ${e.message}`);
+  }
+});
+
 /* ---------- 聚合 ---------- */
 section('聚合:GROUP BY / HAVING / DISTINCT / 空表', async () => {
   const db = await seedDb();
@@ -318,8 +433,8 @@ section('子查询:IN / EXISTS / 相关标量 / 派生表', async () => {
   );
   deepEq(
     await db.sql('SELECT a.name FROM authors a WHERE EXISTS (SELECT 1 FROM entries e WHERE e.authorId = a.id) ORDER BY a.name'),
-    [{ name: '丙' }, { name: '乙' }, { name: '甲' }],
-    '相关 EXISTS(hash 半连接)',
+    [{ name: '丙' }, { name: '甲' }, { name: '乙' }],
+    '相关 EXISTS(hash 半连接,名字按拼音序)',
   );
   deepEq(
     await db.sql('SELECT a.name FROM authors a WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.authorId = a.id)'),
@@ -328,7 +443,7 @@ section('子查询:IN / EXISTS / 相关标量 / 派生表', async () => {
   );
   deepEq(
     await db.sql('SELECT a.name, (SELECT COUNT(*) FROM entries e WHERE e.authorId = a.id) AS n FROM authors a ORDER BY a.name'),
-    [{ name: '丁', n: 0 }, { name: '丙', n: 3 }, { name: '乙', n: 2 }, { name: '甲', n: 4 }],
+    [{ name: '丙', n: 3 }, { name: '丁', n: 0 }, { name: '甲', n: 4 }, { name: '乙', n: 2 }],
     '相关标量 COUNT(空组补 0)',
   );
   deepEq(
