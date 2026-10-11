@@ -22,7 +22,15 @@
  *
  * 执行模型:AST → 编译为 JS 闭包(不用 new Function,CSP 安全),
  * 谓词遵循 SQL 三值逻辑(NULL 参与 → null,过滤条件须 === true)。
+ * 行 = 文档数组(下标 = 别名序,join 逐层 concat 追加),闭包编译时捕获
+ * 别名下标,免每行 spread 复制累积属性。
  * join/IN/EXISTS/相关标量共享同一套 hash 原语(Map/Set + 探测)。
+ * WHERE 合取项按下推执行:单源项在对应表进入时过滤(FROM 侧 / INNER
+ * 新表侧),多源项在引用源齐备处过滤;聚合与相关子查询项留在 join 后。
+ * LIMIT 无排序/去重/聚合时短路:只产出前 offset+limit 行(产出为稳定前缀,
+ * 与全量产出后切片一致);ORDER BY + LIMIT 走 top-N 定长堆,免全量排序。
+ * 单键等值 hash(join 桶 / 相关子查询)以原始值直接作 Map 键,免逐行
+ * 拼规范串;对象键退 JSON 串并隔离存放,不与原始字符串撞键。
  * ============================================================ */
 
 /* ---------- tokenizer ---------- */
@@ -432,6 +440,33 @@ function keyTuple(ks) {
   return ks.length === 1 ? normKey(ks[0]) : JSON.stringify(ks.map(normKey));
 }
 
+/** 单键等值 hash(join 桶 / 相关子查询):原始值直接作键 —— 数字/字符串/
+ *  布尔按 SameValueZero 天然分型(1 与 '1' 不混),免逐行拼规范串;对象无
+ *  值语义,退 JSON 规范串并放独立 Map,原始字符串不可能与之撞键 */
+class KeyMap {
+  #prim = new Map();
+  #obj = new Map();
+  get(v) {
+    return typeof v === 'object' ? this.#obj.get(normKey(v)) : this.#prim.get(v);
+  }
+  set(v, val) {
+    if (typeof v === 'object') this.#obj.set(normKey(v), val);
+    else this.#prim.set(v, val);
+  }
+  has(v) {
+    return typeof v === 'object' ? this.#obj.has(normKey(v)) : this.#prim.has(v);
+  }
+  *values() {
+    yield* this.#prim.values();
+    yield* this.#obj.values();
+  }
+}
+
+/** 行 = 文档数组(下标 = 别名在该 scope.sources 中的序,与 join 追加序
+ *  一致);scope.idx 是别名→下标。闭包编译时捕获下标,免每行 spread 复制
+ *  累积属性 */
+const mkScope = (sources, outer = null) => ({ sources, outer, idx: new Map(sources.map((s, i) => [s, i])) });
+
 /** 分组键:null 也可分组(不同于 join) */
 function groupKey(ks) {
   return ks.length === 1 ? normKey(ks[0]) : JSON.stringify(ks.map(normKey));
@@ -602,10 +637,11 @@ class Runtime {
     const parts = e.parts;
     if (scope.sources.includes(parts[0])) {
       const owner = parts[0];
+      const at = scope.idx.get(owner);
       const path = parts.slice(1);
       return {
         fn: (row) => {
-          const d = row?.[owner];
+          const d = row?.[at];
           if (d == null) return null;
           return norm(pathGet(d, path));
         },
@@ -627,14 +663,16 @@ class Runtime {
     if (opts.strict) {
       throw new Error(`列 '${parts.join('.')}' 无法解析:相关子查询的关联列必须带直接外层表的别名前缀`);
     }
-    /* 裸列:本层各源动态查找(取第一个含该字段的源) */
+    /* 裸列:本层各源动态查找(取第一个含该字段的源)—— 按 scope 自身
+     * 的序遍历(探测序 scope 配 [d] 探测行,首源即新表) */
     const key = parts[0];
     const path = parts;
+    const n = scope.sources.length;
     return {
       fn: (row) => {
         if (row) {
-          for (const s of scope.sources) {
-            const d = row[s];
+          for (let i = 0; i < n; i++) {
+            const d = row[i];
             if (d != null && key in d) return norm(pathGet(d, path));
           }
         }
@@ -908,7 +946,7 @@ class Runtime {
     if (q.items.length !== 1 || q.items[0].star) {
       throw new Error('该位置的子查询必须恰好输出一列');
     }
-    return this.compileExpr(q.items[0].e, { sources: [q.from.alias], outer: null });
+    return this.compileExpr(q.items[0].e, mkScope([q.from.alias]));
   }
 
   /**
@@ -918,7 +956,7 @@ class Runtime {
   buildCorrAux(q, corr, outerScope, kind) {
     if (q.joins.length) throw new Error('不支持:相关子查询内含 JOIN');
     const alias = q.from.alias;
-    const subScope = { sources: [alias], outer: null };
+    const subScope = mkScope([alias]);
     const resFn = corr.residual.length
       ? this.compileExpr(corr.residual.reduce((a, b) => ({ t: 'bin', op: 'AND', l: a, r: b })), subScope).fn
       : null;
@@ -927,28 +965,34 @@ class Runtime {
     const outerKeyFns = corr.eqPairs.map((p) => this.compileExpr(p.outerE, outerScope, { strict: true }).fn);
 
     const innerRows = this.sourceRows(q.from);
-    const map = new Map();
+    /* 单键:原值直接作键(与 exec 的 join 桶同一套 KeyMap 原语) */
+    const single = corr.eqPairs.length === 1;
+    const map = new KeyMap();
     for (const d of innerRows) {
-      const row = { [alias]: d };
+      const row = [d];
       if (resFn && resFn(row, null, null, null) !== true) continue;
-      const kk = keyTuple(innerKeyFns.map((f) => f(row, null, null, null)));
+      const kk = single
+        ? innerKeyFns[0](row, null, null, null)
+        : keyTuple(innerKeyFns.map((f) => f(row, null, null, null)));
       if (kk == null) continue;
       let g = map.get(kk);
       if (!g) map.set(kk, (g = { rows: [], docs: [] }));
       g.rows.push(row);
       g.docs.push(d);
     }
+    const keyOf = (r) => (single
+      ? outerKeyFns[0](r, null, null, null)
+      : keyTuple(outerKeyFns.map((f) => f(r, null, null, null))));
 
     if (kind === 'exists') {
-      const set = new Set(map.keys());
-      return { map, keyOf: (r) => keyTuple(outerKeyFns.map((f) => f(r, null, null, null))), hit: (kk) => set.has(kk) };
+      return { map, keyOf, hit: (kk) => kk != null && map.has(kk) };
     }
     if (kind === 'in') {
       const valC = this.requireSingleColumn(q);
       for (const g of map.values()) {
         g.vals = new Set(g.rows.map((r) => normKey(valC.fn(r, null, null, null))).filter((k) => k !== '\u0000'));
       }
-      return { map, keyOf: (r) => keyTuple(outerKeyFns.map((f) => f(r, null, null, null))) };
+      return { map, keyOf };
     }
     /* scalar:单列聚合,逐组预计算 */
     if (q.groupBy.length) throw new Error('不支持:相关标量子查询含 GROUP BY');
@@ -963,7 +1007,7 @@ class Runtime {
       g.aggValue = this.computeAgg(aggNode, { rows: g.rows, aggs: g.aggs }, aggScope);
     }
     const emptyDefault = aggNode.name === 'COUNT' ? 0 : null;
-    return { map, emptyDefault, keyOf: (r) => keyTuple(outerKeyFns.map((f) => f(r, null, null, null))) };
+    return { map, emptyDefault, keyOf };
   }
 
   compileSubScalar(e, scope) {
@@ -1001,29 +1045,31 @@ class Runtime {
 
   /* ---------- JOIN ---------- */
 
-  /** ON 等值编译:返回 [{left, right}](外层行键 / 新表键);多 AND 项为多键 */
+  /** ON 等值编译:返回 [{left, right}](外层行键 / 新表键);多 AND 项为多键。
+   *  左键按积累行序编译(求值于 join 前的积累行);右键按"新表优先"探测序
+   *  编译(求值于 [文档] 单元探测行,右键表达式只引用新表) */
   compileJoinOn(on, accumSources, newAlias) {
     const pairs = [];
+    const rowScope = mkScope([...accumSources, newAlias]);
+    const probeScope = mkScope([newAlias, ...accumSources]);
     for (const c of flattenAnd(on)) {
       if (c?.t !== 'bin' || c.op !== '=') {
         throw new Error('JOIN ON 仅支持等值条件(可 AND 多键);范围连接不支持');
       }
-      const scope = { sources: [...accumSources, newAlias], outer: null };
-      const L = this.compileExpr(c.l, scope);
-      const R = this.compileExpr(c.r, scope);
+      const L = this.compileExpr(c.l, rowScope);
+      const R = this.compileExpr(c.r, rowScope);
       const subsetNew = (s) => s.size > 0 && [...s].every((x) => x === newAlias);
       const disjointNew = (s) => !s.has(newAlias);
+      const rightOf = (e) => this.compileExpr(e, probeScope).fn;
       if (subsetNew(L.refs) && !L.wild && disjointNew(R.refs) && !R.wild && R.refs.size > 0) {
-        pairs.push({ left: R.fn, right: L.fn });
+        pairs.push({ left: R.fn, right: rightOf(c.l) });
       } else if (subsetNew(R.refs) && !R.wild && disjointNew(L.refs) && !L.wild && L.refs.size > 0) {
-        pairs.push({ left: L.fn, right: R.fn });
+        pairs.push({ left: L.fn, right: rightOf(c.r) });
       } else if (L.wild && disjointNew(R.refs) && !R.wild && R.refs.size > 0) {
         /* 裸列侧按新表优先解析 */
-        const LN = this.compileExpr(c.l, { sources: [newAlias, ...accumSources], outer: null });
-        pairs.push({ left: R.fn, right: LN.fn });
+        pairs.push({ left: R.fn, right: rightOf(c.l) });
       } else if (R.wild && disjointNew(L.refs) && !L.wild && L.refs.size > 0) {
-        const RN = this.compileExpr(c.r, { sources: [newAlias, ...accumSources], outer: null });
-        pairs.push({ left: L.fn, right: RN.fn });
+        pairs.push({ left: L.fn, right: rightOf(c.r) });
       } else {
         throw new Error(`JOIN ON 条件无法定向(裸列请加表别名前缀)`);
       }
@@ -1034,54 +1080,211 @@ class Runtime {
   /* ---------- 主执行(同步;数据均已物化) ---------- */
 
   exec(q) {
-    const scope = { sources: [], outer: null };
-    scope.sources.push(q.from.alias);
-    let rows = this.sourceRows(q.from).map((d) => ({ [q.from.alias]: d }));
+    const accSources = [q.from.alias];   /* 积累行序 = 文档数组下标 */
 
-    for (const j of q.joins) {
-      const jrows = this.sourceRows(j.ref);
-      const pairs = this.compileJoinOn(j.on, scope.sources, j.ref.alias);
-      scope.sources.push(j.ref.alias);
-      const buckets = new Map();
-      for (const d of jrows) {
-        const probe = { [j.ref.alias]: d };
-        const kk = keyTuple(pairs.map((p) => p.right(probe, null, null, null)));
-        if (kk == null) continue;  // null 键不匹配
-        let arr = buckets.get(kk);
-        if (!arr) buckets.set(kk, (arr = []));
-        arr.push(d);
-      }
-      const next = [];
-      for (const lr of rows) {
-        const kk = keyTuple(pairs.map((p) => p.left(lr, null, null, null)));
-        const hits = kk == null ? null : buckets.get(kk);
-        if (hits) {
-          for (const d of hits) next.push({ ...lr, [j.ref.alias]: d });
-        } else if (j.type === 'left') {
-          next.push({ ...lr, [j.ref.alias]: NULLROW });
-        }
-      }
-      rows = next;
-    }
-
+    /* WHERE 谓词下推:AND 合取项按引用源提前过滤,缩小进入 join 的行集。
+     * 全源 scope 预编译(与整条编译的解析/报错语义一致)。单源项推到该表
+     * 进入处 —— FROM 侧与 INNER 新表侧均与 join 后过滤等价,LEFT 新表侧
+     * 可空(null 扩展行会凭空存活)不推;多源项在引用源齐备的下一层 join
+     * 前过滤(每条输出行唯一继承一条积累行,等价)。含聚合(维持原报错
+     * 时机)或相关子查询(refs 含 'outer',行依赖不可移位)的项留在原位。
+     * AND 仅两侧均真才为真,拆项逐个 === true 过滤与整条过滤结果一致。 */
+    /* 全源 scope:WHERE 合取项与投影/HAVING/GROUP/ORDER 引用的源集合在
+     * 解析期即完全确定,统一在 join 前编译(与 join 后编译等价,报错语义
+     * 一致)——LIMIT 短路需要先知道排序/聚合/去重的存在 */
+    const fullScope = mkScope([q.from.alias, ...q.joins.map((j) => j.ref.alias)]);
+    const lateFns = [];
+    let pending = [];
     if (q.where) {
-      const w = this.compileExpr(q.where, scope).fn;
-      rows = rows.filter((r) => w(r, null, null, null) === true);
+      for (const c of flattenAnd(q.where)) {
+        const cc = this.compileExpr(c, fullScope);
+        if (cc.hasAgg || cc.refs.has('outer')) lateFns.push(cc.fn);
+        else pending.push(cc);
+      }
     }
+    const grab = (ok) => {
+      const fns = [];
+      const keep = [];
+      for (const c of pending) { if (ok(c)) fns.push(c.fn); else keep.push(c); }
+      pending = keep;
+      return fns;
+    };
+    /* 过滤对象是数组行;源侧文档按下标临时包装后再喂谓词 */
+    const keepRows = (rs, fns) => (fns.length
+      ? rs.filter((r) => fns.every((f) => f(r, null, null, null) === true))
+      : rs);
+    const keepDocs = (ds, at, fns) => (fns.length
+      ? ds.filter((d) => { const w = []; w[at] = d; return fns.every((f) => f(w, null, null, null) === true); })
+      : ds);
 
     /* 投影项先编译(HAVING/GROUP BY/ORDER BY 可引用投影别名) */
-    const items = q.items.map((it) => (it.star ? it : { ...it, c: this.compileExpr(it.e, scope) }));
+    const items = q.items.map((it) => (it.star ? it : { ...it, c: this.compileExpr(it.e, fullScope) }));
     const rewrite = (e) => rewriteAliasRefs(e, items);
-    const havingC = q.having ? this.compileExpr(rewrite(q.having), scope) : null;
-    const groupCs = q.groupBy.map((g) => this.compileExpr(rewrite(g), scope));
-    const orderCs = q.orderBy.map(({ e, desc }) => ({ c: this.compileExpr(rewrite(e), scope), desc }));
+    const havingC = q.having ? this.compileExpr(rewrite(q.having), fullScope) : null;
+    const groupCs = q.groupBy.map((g) => this.compileExpr(rewrite(g), fullScope));
+    const orderCs = q.orderBy.map(({ e, desc }) => ({ c: this.compileExpr(rewrite(e), fullScope), desc }));
 
     const aggMode = groupCs.length > 0
       || items.some((it) => !it.star && it.c.hasAgg)
       || (havingC ? havingC.hasAgg : false)
       || orderCs.some((o) => o.c.hasAgg);
 
-    let records;
+    /* LIMIT 短路:无 DISTINCT/排序/聚合时产出顺序即结果顺序,产出为稳定
+     * 前缀,只产前 offset+limit 行与全量产出后切片逐行一致;剩余 WHERE
+     * 谓词随之内联到产出点应用 */
+    const off = q.offset ?? 0;
+    const need = q.limit != null ? off + q.limit : null;
+    const shortLimit = need != null && !q.distinct && !orderCs.length && !aggMode ? need : null;
+    let whereInlined = false;
+
+    /* FROM 表:仅引用 FROM 别名的项在包装前过滤文档;单表 + 短路边产边停 */
+    const fromFns = grab((c) => c.refs.size === 1 && c.refs.has(q.from.alias));
+    let rows;
+    if (!q.joins.length && shortLimit != null) {
+      const post = [...lateFns, ...pending.map((c) => c.fn)];
+      whereInlined = true;
+      rows = [];
+      for (const d of this.sourceRows(q.from)) {
+        if (rows.length >= shortLimit) break;
+        const w = [d];
+        if (!fromFns.every((f) => f(w, null, null, null) === true)) continue;
+        if (!post.every((f) => f(w, null, null, null) === true)) continue;
+        rows.push(w);
+      }
+    } else {
+      rows = keepDocs(this.sourceRows(q.from), 0, fromFns).map((d) => [d]);
+    }
+
+    for (let ji = 0; ji < q.joins.length; ji++) {
+      const j = q.joins[ji];
+      /* 引用源已齐备的项(多源项在此下推):每条输出行唯一继承一条积累行 */
+      rows = keepRows(rows, grab((c) => [...c.refs].every((a) => accSources.includes(a))));
+
+      let jrows = this.sourceRows(j.ref);
+      const newPos = accSources.length;   /* 新表在行数组中的下标 */
+      const pairs = this.compileJoinOn(j.on, accSources, j.ref.alias);
+      accSources.push(j.ref.alias);
+      if (j.type === 'inner') {
+        /* INNER:桶内的行即最终行,建桶前过滤 */
+        jrows = keepDocs(jrows, newPos, grab((c) => c.refs.size === 1 && c.refs.has(j.ref.alias)));
+      }
+      /* 单键等值:原值直接作 Map 键免拼串;多键退 JSON 元组串 */
+      const single = pairs.length === 1;
+      const buckets = single ? new KeyMap() : new Map();
+      for (const d of jrows) {
+        const probe = [d];   /* 右键按探测序编译,新表即下标 0 */
+        const kk = single
+          ? pairs[0].right(probe, null, null, null)
+          : keyTuple(pairs.map((p) => p.right(probe, null, null, null)));
+        if (kk == null) continue;  // null 键不匹配
+        let arr = buckets.get(kk);
+        if (!arr) buckets.set(kk, (arr = []));
+        arr.push(d);
+      }
+      /* 末层 join + 短路:剩余谓词内联应用,产够 offset+limit 行即停 */
+      const inline = ji === q.joins.length - 1 && shortLimit != null
+        ? [...lateFns, ...pending.map((c) => c.fn)]
+        : null;
+      if (inline) whereInlined = true;
+      const next = [];
+      prod: for (const lr of rows) {
+        if (inline && next.length >= shortLimit) break prod;
+        const kk = single
+          ? pairs[0].left(lr, null, null, null)
+          : keyTuple(pairs.map((p) => p.left(lr, null, null, null)));
+        const hits = kk == null ? null : buckets.get(kk);
+        if (hits) {
+          for (const d of hits) {
+            if (inline && next.length >= shortLimit) break prod;
+            const nr = lr.concat(d);
+            if (inline && !inline.every((f) => f(nr, null, null, null) === true)) continue;
+            next.push(nr);
+          }
+        } else if (j.type === 'left') {
+          const nr = lr.concat(NULLROW);
+          if (inline && !inline.every((f) => f(nr, null, null, null) === true)) continue;
+          next.push(nr);
+        }
+      }
+      rows = next;
+    }
+
+    if (q.where && !whereInlined) {
+      /* 剩余项(聚合 / 相关子查询 / LEFT 右侧引用 / 引用源未齐备)按原位置过滤 */
+      rows = keepRows(rows, [...lateFns, ...pending.map((c) => c.fn)]);
+    }
+
+    /* 投影(浅拷贝顶层,嵌套值与物化共享 —— 结果约定只读)。
+     * 聚合取每组首行求值;排序键直接挂在投影对象上,免 keyed 包装 */
+    const project = (row, group) => {
+      const out = {};
+      for (const it of items) {
+        if (it.star === true) {
+          for (let i = 0; i < fullScope.sources.length; i++) Object.assign(out, row?.[i] ?? {});
+        } else if (typeof it.star === 'string') {
+          Object.assign(out, row?.[fullScope.idx.get(it.star)] ?? {});
+        } else {
+          out[it.name] = norm(it.c.fn(row, group, out, null));
+        }
+      }
+      return { out, row, group };
+    };
+    /* 排序比较:null 恒排最后,不随 DESC 翻转 */
+    const cmpKeyed = (a, b) => {
+      for (let idx = 0; idx < orderCs.length; idx++) {
+        const va = a.ks[idx];
+        const vb = b.ks[idx];
+        if (va == null || vb == null) {
+          if (va != null) return -1;
+          if (vb != null) return 1;
+          continue;
+        }
+        const c = cmpVal(va, vb);
+        if (c) return orderCs[idx].desc ? -c : c;
+      }
+      return 0;
+    };
+
+    if (orderCs.length && need != null && !q.distinct && !aggMode && need < rows.length) {
+      /* top-N:流式投影 + 定长 need 的"最差居顶"堆 —— 免全量排序,投影
+       * 对象仅保留 need 个(淘汰者即刻可回收);与全量排序后切片逐行一致 */
+      if (!need) return [];
+      const heap = [];
+      const siftUp = (i) => {
+        const e = heap[i];
+        while (i > 0) {
+          const p = (i - 1) >> 1;
+          if (cmpKeyed(heap[p], e) >= 0) break;
+          heap[i] = heap[p];
+          i = p;
+        }
+        heap[i] = e;
+      };
+      const siftDown = () => {
+        const n = heap.length;
+        const e = heap[0];
+        let i = 0;
+        for (;;) {
+          let c = 2 * i + 1;
+          if (c >= n) break;
+          if (c + 1 < n && cmpKeyed(heap[c + 1], heap[c]) > 0) c++;
+          if (cmpKeyed(heap[c], e) <= 0) break;
+          heap[i] = heap[c];
+          i = c;
+        }
+        heap[i] = e;
+      };
+      for (const r of rows) {
+        const x = project(r, null);
+        x.ks = orderCs.map((o) => o.c.fn(r, null, null, null));
+        if (heap.length < need) { heap.push(x); siftUp(heap.length - 1); }
+        else if (cmpKeyed(x, heap[0]) < 0) { heap[0] = x; siftDown(); }
+      }
+      heap.sort(cmpKeyed);
+      return heap.slice(off).map((x) => x.out);
+    }
+
+    let outs;
     if (aggMode) {
       const groups = new Map();
       if (groupCs.length) {
@@ -1096,25 +1299,10 @@ class Runtime {
       }
       let gs = [...groups.values()];
       if (havingC) gs = gs.filter((g) => havingC.fn(g.rows[0] ?? null, g, null, null) === true);
-      records = gs.map((g) => ({ row: g.rows[0] ?? null, group: g }));
+      outs = gs.map((g) => project(g.rows[0] ?? null, g));
     } else {
-      records = rows.map((r) => ({ row: r, group: null }));
+      outs = rows.map((r) => project(r, null));
     }
-
-    /* 投影(浅拷贝顶层,嵌套值与物化共享 —— 结果约定只读) */
-    let outs = records.map((rec) => {
-      const out = {};
-      for (const it of items) {
-        if (it.star === true) {
-          for (const s of scope.sources) Object.assign(out, rec.row?.[s] ?? {});
-        } else if (typeof it.star === 'string') {
-          Object.assign(out, rec.row?.[it.star] ?? {});
-        } else {
-          out[it.name] = norm(it.c.fn(rec.row, rec.group, out, null));
-        }
-      }
-      return { out, rec };
-    });
 
     if (q.distinct) {
       const seen = new Set();
@@ -1127,30 +1315,14 @@ class Runtime {
     }
 
     if (orderCs.length) {
-      const keyed = outs.map((x) => ({ x, ks: orderCs.map((o) => o.c.fn(x.rec.row, x.rec.group, null, null)) }));
-      keyed.sort((a, b) => {
-        for (let idx = 0; idx < orderCs.length; idx++) {
-          const va = a.ks[idx];
-          const vb = b.ks[idx];
-          /* null 恒排最后,不随 DESC 翻转 */
-          if (va == null || vb == null) {
-            if (va != null) return -1;
-            if (vb != null) return 1;
-            continue;
-          }
-          const c = cmpVal(va, vb);
-          if (c) return orderCs[idx].desc ? -c : c;
-        }
-        return 0;
-      });
-      outs = keyed.map((k) => k.x);
+      for (const e of outs) e.ks = orderCs.map((o) => o.c.fn(e.row, e.group, null, null));
+      outs.sort(cmpKeyed);
     }
 
-    const off = q.offset ?? 0;
     if (off || q.limit != null) {
       outs = outs.slice(off, q.limit != null ? off + q.limit : undefined);
     }
-    return outs.map((x) => x.out);
+    return outs.map((e) => e.out);
   }
 }
 

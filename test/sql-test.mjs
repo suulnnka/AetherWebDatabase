@@ -122,6 +122,152 @@ section('JOIN:inner / left / 派生表再 join', async () => {
   );
 });
 
+/* ---------- 谓词下推 ---------- */
+section('下推:语义等价 / LEFT 陷阱 / 裸列动态解析', async () => {
+  const db = await seedDb();
+
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id WHERE a.level = 1')).length,
+    7,
+    'inner:右侧谓词下推(结果不变)',
+  );
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id WHERE a.level = 1 AND e.cat = ?', ['physics'])).length,
+    4,
+    'inner:两侧谓词同时下推',
+  );
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e LEFT JOIN authors a ON e.authorId = a.id WHERE e.cat = ?', ['bio'])).map((r) => r.title).sort(),
+    ['Kappa', 'Zeta'],
+    'left:外层侧谓词下推',
+  );
+  /* LEFT 右侧谓词不可下推:错误下推会让 Theta 的 null 扩展行凭空存活 */
+  deepEq(
+    await db.sql('SELECT e.title, a.name FROM entries e LEFT JOIN authors a ON e.authorId = a.id WHERE a.level = 2 ORDER BY e.title'),
+    [{ title: 'Delta', name: '乙' }, { title: 'Gamma', name: '乙' }],
+    'left:右侧谓词留在 join 后(仅实匹配行存活)',
+  );
+  deepEq(
+    await db.sql('SELECT e.title FROM entries e LEFT JOIN authors a ON e.authorId = a.id WHERE a.id IS NULL'),
+    [{ title: 'Theta' }],
+    'left:右侧 IS NULL 反连接',
+  );
+  /* 三表:a 为 LEFT 右侧,其谓词在 f 进入前对积累行过滤 */
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e LEFT JOIN authors a ON e.authorId = a.id LEFT JOIN (SELECT id FROM authors WHERE level = 1) f ON f.id = a.id WHERE a.level = 1')).length,
+    7,
+    '多表:中层表谓词在下一层 join 前过滤',
+  );
+  /* 裸列多源不推:动态解析取第一个含该字段的源,下推会改变解析对象 */
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id WHERE level = 1')).length,
+    7,
+    '裸列跨表:动态解析语义不变',
+  );
+  deepEq(
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id WHERE e.cat = ? OR a.level = 9 ORDER BY e.title', ['bio'])).map((r) => r.title),
+    ['Kappa', 'Zeta'],
+    '跨表 OR 整体留在 join 后',
+  );
+  deepEq(
+    (await db.sql('SELECT DISTINCT e.cat FROM entries e JOIN authors a ON e.authorId = a.id WHERE e.views > 10 ORDER BY e.cat')),
+    [{ cat: 'bio' }],
+    '下推 + DISTINCT',
+  );
+  deepEq(
+    (await db.sql('SELECT title FROM entries WHERE views > (SELECT AVG(views) FROM entries) ORDER BY title')).map((r) => r.title),
+    ['Alpha', 'Kappa', 'Zeta'],
+    '非相关子查询参与下推项(位置无关)',
+  );
+  deepEq(
+    (await db.sql('SELECT a.name FROM authors a WHERE EXISTS (SELECT 1 FROM entries e WHERE e.authorId = a.id AND e.cat = ?) ORDER BY a.name', ['bio'])).map((r) => r.name),
+    ['丙'],
+    '相关 EXISTS 整体留原位',
+  );
+  try {
+    await db.sql('SELECT id FROM entries WHERE COUNT(*) > 1');
+    t('WHERE 含聚合维持报错', false, '未报错');
+  } catch (e) {
+    t('WHERE 含聚合维持报错', /只能用于/.test(e.message), `消息: ${e.message}`);
+  }
+});
+
+/* ---------- LIMIT 短路 / top-N / 原值键 ---------- */
+section('LIMIT 短路 / top-N / 单键原值', async () => {
+  const db = await seedDb();
+  const all = await db.sql('SELECT title FROM entries');
+
+  deepEq(await db.sql('SELECT title FROM entries LIMIT 3'), all.slice(0, 3), '单表 LIMIT 短路 = 全量切片');
+  deepEq(await db.sql('SELECT title FROM entries LIMIT 3 OFFSET 2'), all.slice(2, 5), 'OFFSET + LIMIT');
+  deepEq(await db.sql('SELECT title FROM entries LIMIT 0'), [], 'LIMIT 0');
+  deepEq(await db.sql('SELECT title FROM entries LIMIT 100'), all, 'LIMIT 超总量');
+  deepEq(
+    await db.sql("SELECT title FROM entries WHERE cat = 'physics' LIMIT 2"),
+    (await db.sql("SELECT title FROM entries WHERE cat = 'physics'")).slice(0, 2),
+    '已下推谓词 + 短路',
+  );
+  deepEq(
+    await db.sql("SELECT e.title, a.name FROM entries e JOIN authors a ON e.authorId = a.id WHERE a.level = 1 LIMIT 3"),
+    (await db.sql("SELECT e.title, a.name FROM entries e JOIN authors a ON e.authorId = a.id WHERE a.level = 1")).slice(0, 3),
+    'join + 右侧谓词(留原位)+ 短路',
+  );
+  deepEq(
+    await db.sql('SELECT e.title FROM entries e LEFT JOIN authors a ON e.authorId = a.id LIMIT 4'),
+    (await db.sql('SELECT e.title FROM entries e LEFT JOIN authors a ON e.authorId = a.id')).slice(0, 4),
+    'left join 短路(null 扩展行照常计数)',
+  );
+  deepEq(
+    await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id JOIN (SELECT id FROM authors WHERE level = 1) f ON f.id = a.id LIMIT 3'),
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id JOIN (SELECT id FROM authors WHERE level = 1) f ON f.id = a.id')).slice(0, 3),
+    '三表链短路(仅末层短路)',
+  );
+
+  /* top-N = 全量排序后切片 */
+  const sorted = await db.sql('SELECT title FROM entries ORDER BY views DESC, title');
+  deepEq(await db.sql('SELECT title FROM entries ORDER BY views DESC, title LIMIT 3'), sorted.slice(0, 3), 'top-N 单键排序');
+  deepEq(await db.sql('SELECT title FROM entries ORDER BY views DESC, title LIMIT 3 OFFSET 2'), sorted.slice(2, 5), 'top-N + OFFSET');
+  deepEq(await db.sql('SELECT title FROM entries ORDER BY views DESC, title LIMIT 0'), [], 'top-N LIMIT 0');
+  deepEq(await db.sql('SELECT title FROM entries ORDER BY views DESC, title LIMIT 100'), sorted, 'top-N 超总量(走全量排序)');
+  deepEq(
+    await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id ORDER BY a.name, e.views LIMIT 4'),
+    (await db.sql('SELECT e.title FROM entries e JOIN authors a ON e.authorId = a.id ORDER BY a.name, e.views')).slice(0, 4),
+    'join + 多键 top-N',
+  );
+  deepEq(
+    (await db.sql('SELECT id FROM entries ORDER BY views DESC LIMIT 4')).map((r) => r.id).includes('e4'),
+    false,
+    '排序键为 null 的行恒排最后(top-N 不误入)',
+  );
+
+  /* 单键原值:类型不混、对象按 JSON 等值 */
+  const kdb = await newDb('keys');
+  await kdb.collection('l').insertMany([
+    { id: 'l1', k: 1 }, { id: 'l2', k: '1' }, { id: 'l3', k: true },
+    { id: 'l4', k: { a: 1 } }, { id: 'l5', k: { a: 1 } },
+  ]);
+  await kdb.collection('r').insertMany([
+    { id: 'r1', k: 1 }, { id: 'r2', k: '1' }, { id: 'r3', k: true }, { id: 'r4', k: { a: 1 } },
+  ]);
+  deepEq(
+    await kdb.sql('SELECT l.id AS lid, r.id AS rid FROM l JOIN r ON l.k = r.k ORDER BY lid, rid'),
+    [
+      { lid: 'l1', rid: 'r1' }, { lid: 'l2', rid: 'r2' }, { lid: 'l3', rid: 'r3' },
+      { lid: 'l4', rid: 'r4' }, { lid: 'l5', rid: 'r4' },
+    ],
+    '原值键:数字/字符串/布尔不互混,对象 JSON 等值',
+  );
+  deepEq(
+    await kdb.sql('SELECT l.id AS lid FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.k = l.k) ORDER BY lid'),
+    [{ lid: 'l1' }, { lid: 'l2' }, { lid: 'l3' }, { lid: 'l4' }, { lid: 'l5' }],
+    '原值键:相关 EXISTS 同一原语',
+  );
+  deepEq(
+    (await kdb.sql('SELECT l.id AS lid FROM l WHERE l.k IN (SELECT k FROM r) ORDER BY lid')).length,
+    5,
+    '原值键:相关 IN 同一原语',
+  );
+});
+
 /* ---------- 聚合 ---------- */
 section('聚合:GROUP BY / HAVING / DISTINCT / 空表', async () => {
   const db = await seedDb();
